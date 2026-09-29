@@ -1,0 +1,253 @@
+"""Users, groups, and library permissions."""
+
+import tempfile
+import unittest
+from pathlib import Path
+
+import server
+
+
+def cell(value, stamp="t0"):
+    return {"v": value, "t": stamp}
+
+
+class AccessTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.con = server.init_db(Path(self.tmp.name) / "cloud.sqlite")
+        self.admin = self.person("Ada", "admin-pass", True)
+        self.ana = self.person("Ana", "ana-pass", False)
+        self.bo = self.person("Bo", "bo-pass", False)
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def person(self, name, password, is_admin):
+        user_id = server.create_user(self.con, name, password, is_admin)
+        row = self.con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return server._actor_from_row(self.con, row)
+
+    def sync(self, actor, body):
+        result = server.apply_sync(self.con, body, actor)
+        self.con.commit()
+        return result
+
+    def grant(self, library_id, grants):
+        server.replace_library_grants(self.con, library_id, grants)
+        self.con.commit()
+
+    def entry_grant(self, user, see, edit="none", create="none", erase="none"):
+        return {
+            "subject_type": "user",
+            "subject_id": user["id"],
+            "target": "entry",
+            "see": see,
+            "edit": edit,
+            "create": create,
+            "erase": erase,
+        }
+
+    def test_user_sees_only_entries_they_created(self):
+        self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "lib1",
+                "name": "Visits",
+                "fields": [{"id": "f1", "name": "Site", "type": "text"}, {"id": "notes", "name": "Notes", "type": "text"}],
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+            "entries": [],
+        })
+        self.grant("lib1", [
+            self.entry_grant(self.ana, "own", "own", "all", "own"),
+            {"subject_type": "user", "subject_id": self.ana["id"], "target": "library", "see": "all"},
+        ])
+        self.sync(self.admin, {
+            "cursor": 0,
+            "entries": [{
+                "id": "admin-entry",
+                "library_id": "lib1",
+                "values": {"f1": cell("Office")},
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:01:00Z",
+            }],
+        })
+        ana = self.sync(self.ana, {
+            "cursor": 0,
+            "entries": [{
+                "id": "ana-entry",
+                "library_id": "lib1",
+                "values": {"f1": cell("Pier")},
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:02:00Z",
+            }],
+        })
+        visible = {item["id"] for item in ana["changes"] if item["kind"] == "entry"}
+        hidden = {item["id"] for item in ana["hidden"] if item["kind"] == "entry"}
+        self.assertIn("ana-entry", visible)
+        self.assertNotIn("admin-entry", visible)
+        self.assertIn("admin-entry", hidden)
+        blocked = self.sync(self.ana, {
+            "cursor": ana["cursor"],
+            "entries": [{
+                "id": "admin-entry",
+                "library_id": "lib1",
+                "values": {"f1": cell("Stolen")},
+                "base_rev": 1,
+                "updated_at": "2026-09-28T00:03:00Z",
+            }],
+        })
+        self.assertEqual(blocked["accepted"], [])
+        self.assertEqual(blocked["forbidden"][0]["error"], "You cannot see this entry")
+
+    def test_group_grant_lets_members_see_every_entry(self):
+        self.con.execute("INSERT INTO groups (id, name) VALUES ('g1', 'Field')")
+        self.con.execute("INSERT INTO group_members (group_id, user_id) VALUES ('g1', ?)", (self.bo["id"],))
+        self.con.commit()
+        self.bo = self.person_existing(self.bo["id"])
+        self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "lib1",
+                "name": "Visits",
+                "fields": [{"id": "f1", "name": "Site", "type": "text"}],
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+            "entries": [{
+                "id": "e1",
+                "library_id": "lib1",
+                "values": {"f1": cell("Pier")},
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:01Z",
+            }],
+        })
+        self.grant("lib1", [{
+            "subject_type": "group",
+            "subject_id": "g1",
+            "target": "library",
+            "see": "all",
+        }, {
+            "subject_type": "group",
+            "subject_id": "g1",
+            "target": "entry",
+            "see": "all",
+            "edit": "own",
+            "create": "all",
+            "erase": "own",
+        }])
+        pulled = self.sync(self.bo, {"cursor": 0, "libraries": [], "entries": []})
+        ids = {item["id"] for item in pulled["changes"] if item["kind"] == "entry"}
+        self.assertIn("e1", ids)
+
+    def test_field_grant_blocks_one_field_and_erase_is_own(self):
+        self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "lib1",
+                "name": "Visits",
+                "fields": [{"id": "f1", "name": "Site", "type": "text"}, {"id": "notes", "name": "Notes", "type": "text"}],
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+            "entries": [],
+        })
+        self.grant("lib1", [
+            self.entry_grant(self.ana, "all", "all", "all", "own"),
+            {"subject_type": "user", "subject_id": self.ana["id"], "target": "library", "see": "all"},
+            {
+                "subject_type": "user",
+                "subject_id": self.ana["id"],
+                "target": "field",
+                "field_id": "notes",
+                "see": "none",
+                "edit": "none",
+            },
+        ])
+        created = self.sync(self.admin, {
+            "cursor": 0,
+            "entries": [{
+                "id": "e1",
+                "library_id": "lib1",
+                "values": {"f1": cell("Pier"), "notes": cell("secret")},
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:01:00Z",
+            }],
+        })
+        pulled = self.sync(self.ana, {"cursor": 0, "entries": []})
+        entry = next(item for item in pulled["changes"] if item["id"] == "e1")
+        self.assertNotIn("notes", entry["values"])
+        self.assertEqual(entry["values"]["f1"]["v"], "Pier")
+        edited = self.sync(self.ana, {
+            "cursor": pulled["cursor"],
+            "entries": [{
+                "id": "e1",
+                "library_id": "lib1",
+                "values": {"f1": cell("Pier north"), "notes": cell("nope")},
+                "base_rev": 1,
+                "updated_at": "2026-09-28T00:02:00Z",
+            }],
+        })
+        self.assertEqual(edited["forbidden"][0]["error"], "You cannot edit that field")
+        site = self.sync(self.ana, {
+            "cursor": pulled["cursor"],
+            "entries": [{
+                "id": "e1",
+                "library_id": "lib1",
+                "values": {"f1": cell("Pier north")},
+                "base_rev": 1,
+                "updated_at": "2026-09-28T00:03:00Z",
+            }],
+        })
+        self.assertEqual(site["accepted"][0]["rev"], 2)
+        stored = self.con.execute("SELECT values_json FROM entries WHERE id = 'e1'").fetchone()[0]
+        self.assertIn("secret", stored)
+        erased = self.sync(self.ana, {
+            "cursor": site["cursor"],
+            "entries": [{
+                "id": "e1",
+                "library_id": "lib1",
+                "values": {"f1": cell("Pier north")},
+                "base_rev": 2,
+                "deleted": True,
+                "updated_at": "2026-09-28T00:04:00Z",
+            }],
+        })
+        self.assertEqual(erased["forbidden"][0]["error"], "You cannot erase this entry")
+
+    def test_non_admin_cannot_create_a_library_until_allowed(self):
+        blocked = self.sync(self.ana, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "lib2",
+                "name": "Mine",
+                "fields": [{"id": "f1", "name": "Site", "type": "text"}],
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+        })
+        self.assertEqual(blocked["forbidden"][0]["error"], "You cannot create libraries")
+        server.set_library_creators(self.con, [{"subject_type": "user", "subject_id": self.ana["id"]}])
+        self.con.commit()
+        created = self.sync(self.ana, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "lib2",
+                "name": "Mine",
+                "fields": [{"id": "f1", "name": "Site", "type": "text"}],
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+        })
+        self.assertEqual(created["accepted"][0]["rev"], 1)
+        self.assertTrue(created["access"]["grants"])
+
+    def person_existing(self, user_id):
+        row = self.con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return server._actor_from_row(self.con, row)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,5 @@
+cloud.sqlite
+__pycache__/
+*.pyc
+.Python
+.chrome-profile/

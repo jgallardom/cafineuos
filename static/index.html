@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#146c54" />
+  <title>Cafinewo</title>
+  <link rel="manifest" href="/static/manifest.webmanifest" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="top"></header>
+    <div id="notice" hidden></div>
+    <main id="main"></main>
+  </div>
+  <script>
+    window.addEventListener("error", (event) => {
+      const note = document.getElementById("notice");
+      if (!note) return;
+      note.hidden = false;
+      note.textContent = event.message;
+    });
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
