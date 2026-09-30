@@ -13,6 +13,7 @@ const state = {
   needsSetup: false,
   directory: null,
   permRows: [],
+  previews: {},
 };
 
 let dbPromise = null;
@@ -128,14 +129,72 @@ function can(libraryId, target, action, createdBy, fieldId) {
 }
 
 function canCreateLibrary() {
-  return !!state.access?.is_admin || can("*", "library", "create");
+  return !!state.access?.is_admin;
+}
+
+function libraryAccess(library) {
+  return library?.access || {
+    create: { mode: "none", users: [] },
+    edit: { mode: "none", users: [] },
+    erase: { mode: "none", users: [] },
+  };
+}
+
+function ruleOk(rule, createdBy) {
+  if (!rule) return false;
+  if (rule.mode === "all") return true;
+  if (rule.mode === "own") return !!createdBy && createdBy === state.session?.user?.id;
+  if (rule.mode === "list") return (rule.users || []).includes(state.session?.user?.id);
+  return false;
+}
+
+function roleIds(library, values, role) {
+  const field = (library?.fields || []).find((item) => item.role === role);
+  const raw = field ? values?.[field.id]?.v : null;
+  if (Array.isArray(raw)) return raw.map(String);
+  return [];
+}
+
+function canSeeEntry(library, entry) {
+  if (state.access?.is_admin) return true;
+  if (can(library.id, "entry", "see", entry?.created_by)) return true;
+  if (entry?.created_by && entry.created_by === state.session?.user?.id) return true;
+  return roleIds(library, entry?.values, "viewers").includes(state.session?.user?.id);
+}
+
+function canEditEntry(library, entry) {
+  if (state.access?.is_admin) return true;
+  if (can(library.id, "entry", "edit", entry?.created_by)) return true;
+  if (roleIds(library, entry?.values, "editors").includes(state.session?.user?.id)) return true;
+  return ruleOk(libraryAccess(library).edit, entry?.created_by);
+}
+
+function canEditField(library, entry, field) {
+  if (canEditEntry(library, entry)) return true;
+  if (field?.viewer_edit && field.role !== "viewers" && field.role !== "editors" && canSeeEntry(library, entry)) return true;
+  return false;
+}
+
+function canCreateEntry(library) {
+  if (state.access?.is_admin) return true;
+  if (can(library.id, "entry", "create")) return true;
+  return ruleOk(libraryAccess(library).create, null);
+}
+
+function canEraseEntry(library, entry) {
+  if (state.access?.is_admin) return true;
+  if (can(library.id, "entry", "erase", entry?.created_by)) return true;
+  return ruleOk(libraryAccess(library).erase, entry?.created_by);
 }
 
 function canSeeLibrary(library) {
   if (state.access?.is_admin) return true;
   if (can(library.id, "library", "see", library.created_by)) return true;
   const entrySee = bestLevel(library.id, "entry", "see");
-  return entrySee === "all" || entrySee === "own";
+  if (entrySee === "all" || entrySee === "own") return true;
+  const access = libraryAccess(library);
+  if (["create", "edit", "erase"].some((key) => ruleOk(access[key], library.created_by))) return true;
+  return state.entries.some((entry) => entry.library_id === library.id && !entry.deleted && canSeeEntry(library, entry));
 }
 
 async function api(path, body) {
@@ -188,11 +247,12 @@ function dbName() {
 function openDb() {
   const name = dbName();
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(name, 1);
+    const request = indexedDB.open(name, 2);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta");
       if (!db.objectStoreNames.contains("libraries")) db.createObjectStore("libraries", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("blobs")) db.createObjectStore("blobs", { keyPath: "id" });
       if (!db.objectStoreNames.contains("entries")) {
         const entries = db.createObjectStore("entries", { keyPath: "id" });
         entries.createIndex("by_library", "library_id");
@@ -248,7 +308,7 @@ async function putOne(store, value, key) {
 }
 
 async function loadState() {
-  state.libraries = await getAll("libraries");
+  state.libraries = (await getAll("libraries")).map(withTitleField);
   state.entries = await getAll("entries");
 }
 
@@ -265,7 +325,7 @@ function libraryById(id) {
 function entriesFor(libraryId) {
   const query = state.query.trim().toLowerCase();
   return state.entries
-    .filter((entry) => entry.library_id === libraryId && !entry.deleted && can(libraryId, "entry", "see", entry.created_by))
+    .filter((entry) => entry.library_id === libraryId && !entry.deleted && canSeeEntry(libraryById(libraryId), entry))
     .filter((entry) => {
       if (!query) return true;
       return JSON.stringify(entry.values).toLowerCase().includes(query);
@@ -273,14 +333,31 @@ function entriesFor(libraryId) {
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
 }
 
+function titleFields(fields) {
+  const list = (fields || []).map((field) => ({ ...field }));
+  let index = list.findIndex((field) => field.title);
+  if (index < 0) index = list.findIndex((field) => field.type === "text");
+  const title = index >= 0 ? list.splice(index, 1)[0] : { id: "title" };
+  title.name = "Title";
+  title.type = "text";
+  title.title = true;
+  delete title.role;
+  delete title.options;
+  delete title.optionsText;
+  delete title.viewer_edit;
+  return [title, ...list.filter((field) => !field.title)];
+}
+
+function withTitleField(library) {
+  return { ...library, fields: titleFields(library.fields) };
+}
+
 function entryTitle(library, entry) {
-  if (!library) return "Entry";
-  for (const field of library.fields || []) {
-    if (!can(library.id, "field", "see", entry?.created_by, field.id)) continue;
-    const value = entry.values?.[field.id]?.v;
-    if (value !== null && value !== undefined && value !== "") return String(value);
-  }
-  return "Untitled";
+  const field = titleFields(library?.fields)[0];
+  if (!field) return "Entry";
+  const value = entry?.values?.[field.id]?.v;
+  if (value === null || value === undefined || value === "") return "Untitled";
+  return String(value);
 }
 
 function pendingCount() {
@@ -383,7 +460,7 @@ function renderHeader() {
       : "Offline - saved on this device";
   document.getElementById("top").innerHTML = `
     <div>
-      <h1 class="brand"><button id="home" type="button">Cafinewo</button></h1>
+      <h1 class="brand"><button id="home" type="button">Cafineuos</button></h1>
       <div class="device-line">
         <button id="open-devices" type="button">${esc(device().name)}</button>
         - ${esc(state.session?.user?.name || "")}
@@ -430,6 +507,14 @@ function renderMain() {
   bindMain();
 }
 
+function librariesEmptyText() {
+  if (!isOnline()) {
+    return "Offline is on, so this device is not syncing. Turn it off and sync. A library shared with this account stays on the device that saved it until then.";
+  }
+  if (canCreateLibrary()) return "No libraries yet. Create one, or start from the sample.";
+  return "No libraries shared with this account yet. Sync while online.";
+}
+
 function librariesHtml() {
   const libraries = visibleLibraries();
   const cards = libraries.length
@@ -443,7 +528,7 @@ function librariesHtml() {
           </button>`;
         })
         .join("")}</div>`
-    : `<div class="empty">No libraries yet. Create one, or start from the sample.</div>`;
+    : `<div class="empty">${librariesEmptyText()}</div>`;
   return `
     <div class="screen-head"><h2>Libraries</h2>${canCreateLibrary() ? '<button id="new-library" class="btn primary" type="button">New</button>' : ""}</div>
     <p class="lede">Entries are stored on this device immediately. They sync when you are online. What you can see and change depends on your account.</p>
@@ -452,20 +537,93 @@ function librariesHtml() {
   `;
 }
 
+function groupStorageKey(libraryId) {
+  const userId = state.session?.user?.id || "local";
+  return "cafinewo.groups." + userId + "." + libraryId;
+}
+
+function selectedGroupFields(library) {
+  let ids = [];
+  try {
+    const raw = JSON.parse(localStorage.getItem(groupStorageKey(library.id)) || "[]");
+    if (Array.isArray(raw)) ids = raw.map(String);
+  } catch (error) {
+    ids = [];
+  }
+  return ids
+    .map((id) => (library.fields || []).find((field) => field.id === id))
+    .filter(Boolean);
+}
+
+function saveGroupFields(libraryId, ids) {
+  localStorage.setItem(groupStorageKey(libraryId), JSON.stringify(ids));
+}
+
+function groupLabel(field, entry) {
+  const value = entry?.values?.[field.id]?.v;
+  if (value === null || value === undefined || value === "" || (Array.isArray(value) && value.length === 0)) return "Empty";
+  if (field.type === "boolean") return value ? "Yes" : "No";
+  if (field.type === "users") {
+    const ids = Array.isArray(value) ? value.map(String) : [String(value)];
+    return ids.map((id) => (state.access?.people || []).find((person) => person.id === id)?.name || id).join(", ");
+  }
+  if (Array.isArray(value)) return value.map(String).join(", ");
+  if (value && typeof value === "object") return value.name || "File";
+  return String(value);
+}
+
+function entryRowHtml(library, entry) {
+  return `<button class="row" data-open-entry="${entry.id}" type="button">
+    <span><strong>${esc(entryTitle(library, entry))}</strong><span>${entry.dirty ? "Waiting to sync" : "Synced"}</span></span>
+    ${entry.dirty ? '<i class="dot"></i>' : ""}
+  </button>`;
+}
+
+function groupSectionsHtml(library, entries, fields, depth) {
+  const field = fields[depth];
+  if (!field) return entries.map((entry) => entryRowHtml(library, entry)).join("");
+  const buckets = new Map();
+  entries.forEach((entry) => {
+    const label = groupLabel(field, entry);
+    if (!buckets.has(label)) buckets.set(label, []);
+    buckets.get(label).push(entry);
+  });
+  return [...buckets.keys()].sort((a, b) => a.localeCompare(b)).map((label) => {
+    const items = buckets.get(label);
+    return `<section class="group">
+      <h3>${esc(field.name)}: ${esc(label)} <span class="meta">${items.length}</span></h3>
+      <div class="list">${groupSectionsHtml(library, items, fields, depth + 1)}</div>
+    </section>`;
+  }).join("");
+}
+
+function entriesBlockHtml(library, entries) {
+  if (!entries.length) {
+    return `<div class="empty">${state.query.trim() ? "No matching entries." : "No entries yet."}</div>`;
+  }
+  const fields = selectedGroupFields(library);
+  if (!fields.length) return entries.map((entry) => entryRowHtml(library, entry)).join("");
+  return groupSectionsHtml(library, entries, fields, 0);
+}
+
+function paintEntries(library) {
+  const list = document.getElementById("entry-list");
+  if (!list || !library) return;
+  list.innerHTML = entriesBlockHtml(library, entriesFor(library.id));
+}
+
+function groupPickerHtml(library) {
+  const selected = new Set(selectedGroupFields(library).map((field) => field.id));
+  const boxes = (library.fields || [])
+    .map((field) => `<label class="field check"><input data-group-field="${esc(field.id)}" type="checkbox" ${selected.has(field.id) ? "checked" : ""} /> ${esc(field.name)}</label>`)
+    .join("");
+  return `<div class="group-picker"><span class="meta">Group by</span><div class="group-fields">${boxes}</div></div>`;
+}
+
 function libraryHtml() {
   const library = libraryById(state.libraryId);
   if (!library) return `<p>That library is gone.</p>`;
   const entries = entriesFor(library.id);
-  const rows = entries.length
-    ? entries
-        .map((entry) => {
-          return `<button class="row" data-open-entry="${entry.id}" type="button">
-            <span><strong>${esc(entryTitle(library, entry))}</strong><span>${entry.dirty ? "Waiting to sync" : "Synced"}</span></span>
-            ${entry.dirty ? '<i class="dot"></i>' : ""}
-          </button>`;
-        })
-        .join("")
-    : `<div class="empty">No entries yet.</div>`;
   return `
     <div class="screen-head">
       <div>
@@ -473,34 +631,48 @@ function libraryHtml() {
         <h2>${esc(library.name)}</h2>
       </div>
       <div class="actions">
-        ${can(library.id, "library", "edit", library.created_by) ? '<button id="edit-fields" class="btn ghost" type="button">Fields</button>' : ""}
-        ${state.access?.is_admin ? '<button id="open-access" class="btn ghost" type="button">Access</button>' : ""}
+        ${state.access?.is_admin ? '<button id="edit-fields" class="btn ghost" type="button">Fields</button>' : ""}
       </div>
     </div>
     <input id="q" class="search" placeholder="Search entries" value="${esc(state.query)}" />
-    <div class="list">${rows}</div>
-    <div class="actions">${can(library.id, "entry", "create") ? '<button id="new-entry" class="btn primary" type="button">New entry</button>' : ""}</div>
+    ${groupPickerHtml(library)}
+    <div class="list" id="entry-list">${entriesBlockHtml(library, entries)}</div>
+    <div class="actions">${canCreateEntry(library) ? '<button id="new-entry" class="btn primary" type="button">New entry</button>' : ""}</div>
   `;
 }
 
 function libraryFormHtml() {
   const draft = state.draft;
+  draft.fields = titleFields(draft.fields);
   const fields = draft.fields
     .map((field, index) => {
-      const options = field.type === "choice"
+      if (field.title) {
+        return `<div class="card field-editor">
+          <div class="line">
+            <input value="Title" disabled />
+            <span class="meta">text</span>
+          </div>
+          <p class="lede">Entry title. Text, always first.</p>
+        </div>`;
+      }
+      const options = field.type === "choice" || field.type === "multi"
         ? `<input data-options="${index}" placeholder="Options, comma separated" value="${esc(field.optionsText || "")}" />`
         : "";
+      const role = field.type === "users"
+        ? `<select data-role="${index}"><option value="" ${field.role ? "" : "selected"}>People list</option><option value="viewers" ${field.role === "viewers" ? "selected" : ""}>Who can see the entry</option><option value="editors" ${field.role === "editors" ? "selected" : ""}>Who can modify the entry</option></select>`
+        : `<label class="field check"><input data-viewer-edit="${index}" type="checkbox" ${field.viewer_edit ? "checked" : ""} /> People who can see the entry may edit this field</label>`;
       return `<div class="card field-editor">
         <div class="line">
           <input data-fname="${index}" placeholder="Field name" value="${esc(field.name)}" />
           <select data-ftype="${index}">
-            ${["text", "longtext", "number", "date", "boolean", "choice"]
-              .map((type) => `<option value="${type}" ${field.type === type ? "selected" : ""}>${type}</option>`)
+            ${[["text", "text"], ["longtext", "long text"], ["number", "number"], ["date", "date"], ["time", "time"], ["boolean", "yes or no"], ["choice", "single choice"], ["multi", "multiple choice"], ["users", "people"], ["image", "image"], ["file", "file"]]
+              .map(([type, label]) => `<option value="${type}" ${field.type === type ? "selected" : ""}>${label}</option>`)
               .join("")}
           </select>
           <button class="btn ghost" data-remove-field="${index}" type="button">Remove</button>
         </div>
         ${options}
+        ${role}
       </div>`;
     })
     .join("");
@@ -516,13 +688,36 @@ function libraryFormHtml() {
         <input id="lib-name" value="${esc(draft.name)}" />
       </label>
       ${fields}
+      <h2>Who can use entries</h2>
+      <p class="lede">None, All, Own, or a list of users. Own means the person who created the entry. Admins can always do this.</p>
+      ${accessBlock(draft)}
       <div class="actions">
         <button id="add-field" class="btn ghost" type="button">Add field</button>
         <button id="save-library" class="btn primary" type="button">Save</button>
-        ${draft.id && can(draft.id, "library", "erase", draft.base?.created_by) ? '<button id="delete-library" class="btn danger" type="button">Delete library</button>' : ""}
+        ${draft.id && state.access?.is_admin ? '<button id="delete-library" class="btn danger" type="button">Delete library</button>' : ""}
       </div>
     </div>
   `;
+}
+
+function accessBlock(draft) {
+  const access = draft.access || {
+    create: { mode: "all", users: [] },
+    edit: { mode: "all", users: [] },
+    erase: { mode: "all", users: [] },
+  };
+  const people = state.access?.people || [];
+  return ["create", "edit", "erase"].map((key) => {
+    const rule = access[key] || { mode: "none", users: [] };
+    const modes = key === "create"
+      ? [["none", "None"], ["all", "All"], ["list", "These users"]]
+      : [["none", "None"], ["all", "All"], ["own", "Own"], ["list", "These users"]];
+    const boxes = rule.mode === "list"
+      ? people.map((person) => `<label class="field check"><input data-access-user="${key}" value="${esc(person.id)}" type="checkbox" ${(rule.users || []).includes(person.id) ? "checked" : ""} /> ${esc(person.name)}</label>`).join("")
+      : "";
+    const title = key === "create" ? "Create entries" : key === "edit" ? "Edit entries" : "Delete entries";
+    return `<div class="card"><strong>${title}</strong><select data-access-mode="${key}">${modes.map(([value, label]) => `<option value="${value}" ${rule.mode === value ? "selected" : ""}>${label}</option>`).join("")}</select>${boxes}</div>`;
+  }).join("");
 }
 
 function entryHtml() {
@@ -530,17 +725,39 @@ function entryHtml() {
   const draft = state.draft;
   if (!library || !draft) return `<p>Missing entry.</p>`;
   const createdBy = draft.created_by || state.session?.user?.id;
-  const fields = (library.fields || [])
-    .filter((field) => can(library.id, "field", "see", createdBy, field.id))
+  const fields = titleFields(library.fields)
+    .filter((field) => draft.isNew ? true : canSeeEntry(library, draft))
     .map((field) => {
-      const editable = can(library.id, "field", "edit", createdBy, field.id);
+      const editable = draft.isNew ? canCreateEntry(library) : canEditField(library, draft, field);
       const value = draft.values?.[field.id]?.v ?? "";
       const locked = editable ? "" : "disabled";
+      if (field.type === "users") {
+        const selected = Array.isArray(value) ? value.map(String) : [];
+        const people = state.access?.people || [];
+        const boxes = people.length
+          ? people.map((person) => `<label class="field check"><input data-users="${field.id}" value="${esc(person.id)}" type="checkbox" ${selected.includes(person.id) ? "checked" : ""} ${locked} /> ${esc(person.name)}</label>`).join("")
+          : `<p class="lede">Sync while online once so names are available offline.</p>`;
+        return `<div class="field"><span>${esc(field.name)}</span>${boxes}</div>`;
+      }
+      if (field.type === "multi") {
+        const selected = Array.isArray(value) ? value.map(String) : [];
+        const boxes = (field.options || []).map((option) => `<label class="field check"><input data-multi="${field.id}" value="${esc(option)}" type="checkbox" ${selected.includes(option) ? "checked" : ""} ${locked} /> ${esc(option)}</label>`).join("");
+        return `<div class="field"><span>${esc(field.name)}</span>${boxes}</div>`;
+      }
+      if (field.type === "image" || field.type === "file") {
+        const meta = value && typeof value === "object" ? value : null;
+        const preview = meta && state.previews?.[meta.id] && field.type === "image" ? `<img class="preview" alt="" src="${esc(state.previews[meta.id])}" />` : "";
+        const label = meta?.name ? esc(meta.name) : "No file yet";
+        return `<label class="field">${esc(field.name)}${preview}<span>${label}</span><input data-file="${field.id}" data-kind="${field.type}" type="file" ${field.type === "image" ? 'accept="image/*"' : ""} ${locked} /></label>`;
+      }
       if (field.type === "longtext") {
         return `<label class="field">${esc(field.name)}<textarea data-field="${field.id}" ${locked}>${esc(value)}</textarea></label>`;
       }
       if (field.type === "boolean") {
         return `<label class="field check"><input data-field="${field.id}" type="checkbox" ${value ? "checked" : ""} ${locked} /> ${esc(field.name)}</label>`;
+      }
+      if (field.type === "time") {
+        return `<label class="field">${esc(field.name)}<input data-field="${field.id}" type="time" value="${esc(value)}" ${locked} /></label>`;
       }
       if (field.type === "choice") {
         const options = (field.options || [])
@@ -552,7 +769,7 @@ function entryHtml() {
       return `<label class="field">${esc(field.name)}<input data-field="${field.id}" type="${type}" value="${esc(value)}" ${locked} /></label>`;
     })
     .join("");
-  const canErase = !draft.isNew && can(library.id, "entry", "erase", draft.created_by);
+  const canErase = !draft.isNew && canEraseEntry(library, draft);
   return `
     <div class="screen-head">
       <div>
@@ -664,17 +881,20 @@ function bindMain() {
     q.addEventListener("input", () => {
       state.query = q.value;
       const library = libraryById(state.libraryId);
-      const list = q.parentElement.querySelector(".list");
-      if (library && list) {
-        const entries = entriesFor(library.id);
-        list.innerHTML = entries.length
-          ? entries
-              .map((entry) => `<button class="row" data-open-entry="${entry.id}" type="button"><span><strong>${esc(entryTitle(library, entry))}</strong><span>${entry.dirty ? "Waiting to sync" : "Synced"}</span></span>${entry.dirty ? '<i class="dot"></i>' : ""}</button>`)
-              .join("")
-          : `<div class="empty">No matching entries.</div>`;
-      }
+      if (library) paintEntries(library);
     });
   }
+  document.querySelectorAll("[data-group-field]").forEach((el) => {
+    el.addEventListener("change", () => {
+      const library = libraryById(state.libraryId);
+      if (!library) return;
+      const current = selectedGroupFields(library).map((field) => field.id);
+      const id = el.dataset.groupField;
+      const next = el.checked ? current.concat([id]) : current.filter((item) => item !== id);
+      saveGroupFields(library.id, next);
+      paintEntries(library);
+    });
+  });
   byId("back", () => {
     if (state.screen === "entry") {
       saveEntry(false, { leaveIfEmpty: true, skipIfUnchanged: true });
@@ -688,7 +908,19 @@ function bindMain() {
     else go("libraries");
   });
   byId("new-library", () => {
-    state.draft = { name: "", fields: [{ id: uuid(), name: "", type: "text", optionsText: "" }] };
+    state.draft = {
+      name: "",
+      access: {
+        create: { mode: "all", users: [] },
+        edit: { mode: "all", users: [] },
+        erase: { mode: "all", users: [] },
+      },
+      fields: [
+        { id: uuid(), name: "Title", type: "text", title: true, optionsText: "", role: "", viewer_edit: false },
+        { id: uuid(), name: "Who can see", type: "users", optionsText: "", role: "viewers", viewer_edit: false },
+        { id: uuid(), name: "Who can modify", type: "users", optionsText: "", role: "editors", viewer_edit: false },
+      ],
+    };
     go("edit-library");
   });
   byId("sample", addSample);
@@ -699,10 +931,18 @@ function bindMain() {
       id: library.id,
       name: library.name,
       base: library,
-      fields: (library.fields || []).map((field) => ({
+      access: clone(library.access) || {
+        create: { mode: "all", users: [] },
+        edit: { mode: "all", users: [] },
+        erase: { mode: "all", users: [] },
+      },
+      fields: titleFields(library.fields).map((field) => ({
         id: field.id,
         name: field.name,
         type: field.type,
+        title: !!field.title,
+        role: field.role || "",
+        viewer_edit: !!field.viewer_edit,
         optionsText: (field.options || []).join(", "),
       })),
     };
@@ -756,7 +996,9 @@ function bindMain() {
   });
   document.querySelectorAll("[data-ftype]").forEach((el) => {
     el.addEventListener("change", () => {
-      state.draft.fields[Number(el.dataset.ftype)].type = el.value;
+      const index = Number(el.dataset.ftype);
+      if (state.draft.fields[index]?.title) return;
+      state.draft.fields[index].type = el.value;
       renderMain();
     });
   });
@@ -767,8 +1009,11 @@ function bindMain() {
   });
   document.querySelectorAll("[data-remove-field]").forEach((el) => {
     el.onclick = () => {
+      const index = Number(el.dataset.removeField);
+      if (state.draft.fields[index]?.title) return;
       readLibraryDraft();
-      state.draft.fields.splice(Number(el.dataset.removeField), 1);
+      state.draft.fields.splice(index, 1);
+      state.draft.fields = titleFields(state.draft.fields);
       renderMain();
     };
   });
@@ -796,6 +1041,27 @@ function bindMain() {
   });
   const libName = document.getElementById("lib-name");
   if (libName) libName.addEventListener("input", () => (state.draft.name = libName.value));
+  document.querySelectorAll("[data-role]").forEach((el) => {
+    el.addEventListener("change", () => {
+      state.draft.fields[Number(el.dataset.role)].role = el.value;
+    });
+  });
+  document.querySelectorAll("[data-viewer-edit]").forEach((el) => {
+    el.addEventListener("change", () => {
+      state.draft.fields[Number(el.dataset.viewerEdit)].viewer_edit = el.checked;
+    });
+  });
+  document.querySelectorAll("[data-access-mode]").forEach((el) => {
+    el.addEventListener("change", () => {
+      state.draft.access = state.draft.access || {};
+      state.draft.access[el.dataset.accessMode] = state.draft.access[el.dataset.accessMode] || { mode: "none", users: [] };
+      state.draft.access[el.dataset.accessMode].mode = el.value;
+      renderMain();
+    });
+  });
+  document.querySelectorAll("[data-file]").forEach((el) => {
+    el.addEventListener("change", () => rememberFile(el));
+  });
   bindAccessControls();
 }
 
@@ -813,28 +1079,43 @@ function go(screen) {
 function readLibraryDraft() {
   const name = document.getElementById("lib-name");
   if (name) state.draft.name = name.value;
+  if (!state.draft.access) return;
+  document.querySelectorAll("[data-access-mode]").forEach((el) => {
+    state.draft.access[el.dataset.accessMode] = state.draft.access[el.dataset.accessMode] || { mode: "none", users: [] };
+    state.draft.access[el.dataset.accessMode].mode = el.value;
+  });
+  for (const key of ["create", "edit", "erase"]) {
+    const picked = [...document.querySelectorAll(`[data-access-user="${key}"]`)].filter((box) => box.checked).map((box) => box.value);
+    if (state.draft.access[key]) state.draft.access[key].users = picked;
+  }
 }
 
 async function saveLibrary() {
   readLibraryDraft();
   const draft = state.draft;
   const name = draft.name.trim();
-  const fields = draft.fields
+  const fields = titleFields(draft.fields
     .map((field) => ({
       id: field.id,
-      name: field.name.trim(),
+      name: (field.name || "").trim(),
       type: field.type,
-      options: field.type === "choice"
-        ? field.optionsText.split(",").map((part) => part.trim()).filter(Boolean)
+      role: field.role || "",
+      title: !!field.title,
+      viewer_edit: !!field.viewer_edit,
+      options: field.type === "choice" || field.type === "multi"
+        ? (field.optionsText || "").split(",").map((part) => part.trim()).filter(Boolean)
         : undefined,
     }))
-    .filter((field) => field.name);
+    .filter((field) => field.name || field.title));
   if (!name || !fields.length) {
     notice("Add a name and at least one field.", true);
     return;
   }
   fields.forEach((field) => {
     if (!field.options) delete field.options;
+    if (field.type !== "users") delete field.role;
+    if (!field.viewer_edit) delete field.viewer_edit;
+    if (!field.title) delete field.title;
   });
   const existing = draft.id ? await getOne("libraries", draft.id) : null;
   if (!existing && !canCreateLibrary()) {
@@ -854,6 +1135,7 @@ async function saveLibrary() {
   };
   record.name = name;
   record.fields = fields;
+  record.access = draft.access;
   record.updated_at = now();
   record.dirty = true;
   record.conflict = null;
@@ -879,7 +1161,7 @@ async function deleteLibrary() {
   sync();
 }
 
-function openEntry(id) {
+async function openEntry(id) {
   const entry = state.entries.find((item) => item.id === id);
   if (!entry) return;
   if (entry.conflict) {
@@ -889,6 +1171,15 @@ function openEntry(id) {
   state.entryId = id;
   state.draft = clone(entry);
   state.draft.values = state.draft.values || {};
+  state.previews = {};
+  const library = libraryById(entry.library_id);
+  for (const field of library?.fields || []) {
+    if (field.type !== "image" && field.type !== "file") continue;
+    const meta = state.draft.values?.[field.id]?.v;
+    if (!meta?.id) continue;
+    const row = await getOne("blobs", meta.id);
+    if (row?.blob) state.previews[meta.id] = URL.createObjectURL(row.blob);
+  }
   go("entry");
 }
 
@@ -904,11 +1195,11 @@ async function saveEntry(deleted, options = {}) {
     deleted: false,
     created_by: state.session.user.id,
   };
-  if (deleted && !can(state.libraryId, "entry", "erase", record.created_by)) {
+  if (deleted && !canEraseEntry(libraryById(state.libraryId), record)) {
     notice("You cannot erase this entry.", true);
     return;
   }
-  if (!existing && !deleted && !can(state.libraryId, "entry", "create")) {
+  if (!existing && !deleted && !canCreateEntry(libraryById(state.libraryId))) {
     notice("You cannot create entries here.", true);
     return;
   }
@@ -955,6 +1246,17 @@ function entryChanged(before, after) {
 
 function readEntryFromDom(fallback) {
   const values = clone(fallback) || {};
+  const grouped = new Map();
+  document.querySelectorAll("[data-users], [data-multi]").forEach((el) => {
+    if (el.disabled) return;
+    const fieldId = el.dataset.users || el.dataset.multi;
+    if (!grouped.has(fieldId)) grouped.set(fieldId, []);
+    if (el.checked) grouped.get(fieldId).push(el.value);
+  });
+  grouped.forEach((ids, fieldId) => {
+    const previous = values[fieldId];
+    if (!sameVal(previous, { v: ids })) values[fieldId] = { v: ids, t: now() };
+  });
   document.querySelectorAll("[data-field]").forEach((el) => {
     const value = el.type === "checkbox" ? el.checked : el.value;
     const normalized = value === "" ? null : el.type === "number" && value !== "" ? Number(value) : value;
@@ -975,7 +1277,7 @@ async function addSample() {
   }
   const libraryId = uuid();
   const fields = [
-    { id: uuid(), name: "Site", type: "text" },
+    { id: uuid(), name: "Title", type: "text", title: true },
     { id: uuid(), name: "Visited", type: "date" },
     { id: uuid(), name: "Status", type: "choice", options: ["Open", "Done", "Blocked"] },
     { id: uuid(), name: "Headcount", type: "number" },
@@ -1057,6 +1359,7 @@ function slimLibrary(row) {
     updated_at: row.updated_at,
     deleted: !!row.deleted,
     created_by: row.created_by || "",
+    access: row.access,
   };
 }
 
@@ -1107,7 +1410,68 @@ async function sync() {
   }
 }
 
+async function rememberFile(input) {
+  const file = input.files && input.files[0];
+  if (!file || !state.draft) return;
+  const id = uuid();
+  await putOne("blobs", {
+    id,
+    name: file.name,
+    mime: file.type || "application/octet-stream",
+    blob: file,
+    dirty: true,
+    entry_id: state.draft.id,
+    field_id: input.dataset.file,
+  });
+  state.previews[id] = URL.createObjectURL(file);
+  state.draft.values = state.draft.values || {};
+  state.draft.values[input.dataset.file] = { v: { id, name: file.name, mime: file.type, size: file.size }, t: now() };
+  renderMain();
+}
+
+async function uploadBlobs() {
+  const rows = await getAll("blobs");
+  for (const row of rows.filter((item) => item.dirty)) {
+    const body = new FormData();
+    body.append("id", row.id);
+    body.append("name", row.name || "file");
+    body.append("entry_id", row.entry_id || "");
+    body.append("field_id", row.field_id || "");
+    body.append("file", row.blob, row.name || "file");
+    const response = await fetch("/api/blobs", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + (state.session?.token || "") },
+      body,
+    });
+    if (!response.ok) throw new Error("Could not upload a file");
+    row.dirty = false;
+    await putOne("blobs", row);
+  }
+}
+
+async function downloadMissingBlobs() {
+  const wanted = [];
+  for (const entry of state.entries) {
+    const library = libraryById(entry.library_id);
+    for (const field of library?.fields || []) {
+      if (field.type !== "image" && field.type !== "file") continue;
+      const meta = entry.values?.[field.id]?.v;
+      if (meta?.id) wanted.push(meta);
+    }
+  }
+  for (const meta of wanted) {
+    if (await getOne("blobs", meta.id)) continue;
+    const response = await fetch("/api/blobs/" + encodeURIComponent(meta.id), {
+      headers: { Authorization: "Bearer " + (state.session?.token || "") },
+    });
+    if (!response.ok) continue;
+    const blob = await response.blob();
+    await putOne("blobs", { id: meta.id, name: meta.name || "file", mime: blob.type, blob, dirty: false });
+  }
+}
+
 async function syncOnce() {
+  await uploadBlobs();
   const libraries = (await getAll("libraries")).filter((row) => row.dirty && !row.conflict);
   const entries = (await getAll("entries")).filter((row) => row.dirty && !row.conflict);
   const cursor = (await getOne("meta", "cursor")) || 0;
@@ -1158,6 +1522,8 @@ async function syncOnce() {
     else if ((data.accepted || []).length) notice("Synced");
     else notice("Caught up");
   }
+  await loadState();
+  await downloadMissingBlobs();
   return merged;
 }
 
@@ -1256,6 +1622,7 @@ function fromRemoteLibrary(remote) {
     dirty: false,
     conflict: null,
     created_by: remote.created_by || "",
+    access: remote.access,
   };
 }
 
@@ -1365,7 +1732,7 @@ async function start() {
 function renderAuth() {
   document.getElementById("top").innerHTML = `
     <div>
-      <h1 class="brand">Cafinewo</h1>
+      <h1 class="brand">Cafineuos</h1>
       <div class="device-line">${state.needsSetup ? "Create the first admin" : "Sign in"}</div>
     </div>
   `;
@@ -1421,6 +1788,7 @@ async function bootApp() {
 async function openPeople() {
   try {
     state.directory = await api("/api/directory");
+    state.backup = await api("/api/backup");
     go("people");
   } catch (error) {
     if (error.message !== "signed out") notice(error.message, true);
@@ -1497,6 +1865,17 @@ function peopleHtml() {
     <p class="lede">Admins always can. Tick anyone else who should be able to add a library. They get full access to libraries they create.</p>
     <div class="stack">${creatorBoxes}${groupBoxes}</div>
     <button id="save-creators" class="btn primary" type="button">Save</button>
+    <h2>Backup</h2>
+    <p class="lede">The server keeps a copy of the database and files. Pick a time interval or a number of syncs.</p>
+    <div class="stack">
+      <label class="field">When<select id="backup-mode">
+        <option value="off" ${state.backup?.mode === "off" ? "selected" : ""}>Off</option>
+        <option value="hours" ${state.backup?.mode === "hours" ? "selected" : ""}>Every number of hours</option>
+        <option value="accesses" ${state.backup?.mode === "accesses" ? "selected" : ""}>Every number of syncs</option>
+      </select></label>
+      <label class="field">Every<input id="backup-every" type="number" min="1" value="${esc(state.backup?.every || 24)}" /></label>
+      <button id="save-backup" class="btn primary" type="button">Save backup</button>
+    </div>
   `;
 }
 
@@ -1577,6 +1956,7 @@ function bindAccessControls() {
   byId("add-user", addUser);
   byId("add-group", addGroup);
   byId("save-creators", saveCreators);
+  byId("save-backup", saveBackup);
   byId("save-access", saveAccess);
   document.querySelectorAll("[data-save-user]").forEach((button) => {
     button.onclick = () => saveUser(button.dataset.saveUser);
@@ -1630,6 +2010,18 @@ async function saveGroup(groupId) {
     await api("/api/groups/members", { group_id: groupId, user_ids: userIds });
     notice("Group saved");
     await openPeople();
+  } catch (error) {
+    if (error.message !== "signed out") notice(error.message, true);
+  }
+}
+
+async function saveBackup() {
+  try {
+    state.backup = await api("/api/backup", {
+      mode: document.getElementById("backup-mode").value,
+      every: Number(document.getElementById("backup-every").value || 1),
+    });
+    notice("Backup saved");
   } catch (error) {
     if (error.message !== "signed out") notice(error.message, true);
   }

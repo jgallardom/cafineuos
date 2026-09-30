@@ -1,4 +1,6 @@
 cloud.sqlite
+blobs/
+backups/
 __pycache__/
 *.pyc
 .Python

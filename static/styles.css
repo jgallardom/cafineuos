@@ -343,3 +343,15 @@ h3 {
   font-size: 14px;
   font-weight: 600;
 }
+
+.group-picker { margin: 4px 0 12px; }
+.group-fields { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 6px; }
+.group-fields .field.check { font-size: 14px; }
+.group h3 { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.group .group { margin-left: 12px; }
+
+img.preview {
+  width: 100%;
+  border-radius: 10px;
+  margin-top: 8px;
+}

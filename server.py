@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local sync target for Cafinewo.
+"""Local sync target for Cafineuos.
 
 Each device keeps its own copy and pushes dirty records with the revision
 they were based on. The server accepts the write only when that revision is
@@ -12,9 +12,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import secrets
+import shutil
 import sqlite3
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,9 +25,18 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-DB_PATH = ROOT / "cloud.sqlite"
-HOST = "127.0.0.1"
-PORT = 8765
+DATA = Path(os.environ.get("DATA_DIR", ROOT))
+DB_PATH = DATA / "cloud.sqlite"
+BLOB_DIR = DATA / "blobs"
+BACKUP_DIR = DATA / "backups"
+MAX_BLOB = 12 * 1024 * 1024
+DEFAULT_ACCESS = {
+    "create": {"mode": "all", "users": []},
+    "edit": {"mode": "all", "users": []},
+    "erase": {"mode": "all", "users": []},
+}
+HOST = os.environ.get("HOST", "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8765"))
 LOCK = threading.Lock()
 LEVELS = {"none": 0, "own": 1, "all": 2}
 PASSWORD_ROUNDS = 200_000
@@ -120,12 +132,29 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
             UNIQUE (subject_type, subject_id, library_id, target, field_id)
         );
 
+        CREATE TABLE IF NOT EXISTS blobs (
+            id TEXT PRIMARY KEY,
+            entry_id TEXT,
+            field_id TEXT,
+            name TEXT NOT NULL,
+            mime TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            created_by TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_libraries_seq ON libraries(change_seq);
         CREATE INDEX IF NOT EXISTS idx_entries_seq ON entries(change_seq);
         """
     )
     _ensure_column(con, "libraries", "created_by", "TEXT")
     _ensure_column(con, "entries", "created_by", "TEXT")
+    _ensure_column(con, "libraries", "access_json", "TEXT")
     con.commit()
     return con
 
@@ -264,7 +293,8 @@ def load_grants(con: sqlite3.Connection) -> list[dict]:
 def access_for(con: sqlite3.Connection, actor: dict) -> dict:
     subjects = _subjects(actor)
     grants = [grant for grant in load_grants(con) if (grant["subject_type"], grant["subject_id"]) in subjects]
-    return {"user_id": actor["id"], "is_admin": bool(actor["is_admin"]), "grants": grants}
+    people = [{"id": row["id"], "name": row["name"]} for row in con.execute("SELECT id, name FROM users ORDER BY name")]
+    return {"user_id": actor["id"], "is_admin": bool(actor["is_admin"]), "grants": grants, "people": people}
 
 
 def _best_level(actor: dict, grants: list[dict], library_id: str, target: str, action: str, field_id: str = "") -> str:
@@ -327,7 +357,125 @@ def _can_see_library(actor, grants, row) -> bool:
     if _can(actor, grants, row["id"], "library", "see", row["created_by"]):
         return True
     entry_level = _best_level(actor, grants, row["id"], "entry", "see")
-    return entry_level in ("own", "all")
+    if entry_level in ("own", "all"):
+        return True
+    access = row.get("access") or DEFAULT_ACCESS
+    user_id = actor["id"]
+    for key in ("create", "edit", "erase"):
+        if _rule_ok(access.get(key), user_id, row.get("created_by")):
+            return True
+    return False
+
+
+def _clean_access(raw) -> dict:
+    cleaned = {
+        "create": {"mode": "none", "users": []},
+        "edit": {"mode": "none", "users": []},
+        "erase": {"mode": "none", "users": []},
+    }
+    if not isinstance(raw, dict):
+        return cleaned
+    for key in cleaned:
+        rule = raw.get(key) if isinstance(raw.get(key), dict) else {}
+        mode = rule.get("mode") if rule.get("mode") in {"none", "all", "own", "list"} else "none"
+        if key == "create" and mode == "own":
+            mode = "none"
+        users = [str(item) for item in (rule.get("users") or []) if item]
+        cleaned[key] = {"mode": mode, "users": users}
+    return cleaned
+
+
+def _parse_access(raw) -> dict:
+    if not raw:
+        return _clean_access(None)
+    if isinstance(raw, dict):
+        return _clean_access(raw)
+    try:
+        return _clean_access(json.loads(raw))
+    except (TypeError, json.JSONDecodeError):
+        return _clean_access(None)
+
+
+def _rule_ok(rule, user_id: str, created_by) -> bool:
+    if not rule:
+        return False
+    mode = rule.get("mode") or "none"
+    if mode == "all":
+        return True
+    if mode == "own":
+        return bool(created_by) and created_by == user_id
+    if mode == "list":
+        return user_id in (rule.get("users") or [])
+    return False
+
+
+def _ids_in_value(values, field_id: str) -> set[str]:
+    if not values or not field_id:
+        return set()
+    raw = values.get(field_id)
+    value = raw.get("v") if isinstance(raw, dict) else raw
+    if isinstance(value, list):
+        return {str(item) for item in value if item}
+    if isinstance(value, str) and value:
+        return {value}
+    return set()
+
+
+def _role_ids(library, values, role: str) -> set[str]:
+    if not library:
+        return set()
+    for field in library.get("fields") or []:
+        if field.get("role") == role:
+            return _ids_in_value(values, field.get("id") or "")
+    return set()
+
+
+def _field_by_id(library, field_id: str):
+    for field in (library or {}).get("fields") or []:
+        if field.get("id") == field_id:
+            return field
+    return None
+
+
+def _entry_allowed(actor, grants, library, action: str, created_by, values, field=None) -> bool:
+    if actor is None or actor.get("is_admin"):
+        return True
+    user_id = actor["id"]
+    library_id = (library or {}).get("id") or ""
+    access = (library or {}).get("access") or DEFAULT_ACCESS
+    if action == "see":
+        if _can(actor, grants, library_id, "entry", "see", created_by):
+            return True
+        if created_by == user_id:
+            return True
+        return user_id in _role_ids(library, values, "viewers")
+    if action == "create":
+        return _can(actor, grants, library_id, "entry", "create") or _rule_ok(access.get("create"), user_id, created_by)
+    if action == "erase":
+        return _can(actor, grants, library_id, "entry", "erase", created_by) or _rule_ok(access.get("erase"), user_id, created_by)
+    if field:
+        specific = [
+            grant
+            for grant in grants
+            if (grant["subject_type"], grant["subject_id"]) in _subjects(actor)
+            and grant["library_id"] in (library_id, "*")
+            and grant["target"] == "field"
+            and (grant["field_id"] or "") == (field.get("id") or "")
+        ]
+        if specific:
+            return any(
+                _allows(_level(grant.get("edit") or "none", "edit"), created_by, user_id, "edit")
+                for grant in specific
+            )
+    if _can(actor, grants, library_id, "entry", "edit", created_by):
+        return True
+    if user_id in _role_ids(library, values, "editors"):
+        return True
+    if _rule_ok(access.get("edit"), user_id, created_by):
+        return True
+    if field and field.get("viewer_edit") and field.get("role") not in ("viewers", "editors"):
+        return _entry_allowed(actor, grants, library, "see", created_by, values)
+    return False
 
 
 def _cell_value(cell) -> object:
@@ -432,6 +580,7 @@ def library_out(row: sqlite3.Row) -> dict:
         "updated_by": row["updated_by"],
         "updated_by_name": row["updated_by_name"],
         "created_by": row["created_by"],
+        "access": _parse_access(row["access_json"] if "access_json" in row.keys() else None),
     }
 
 
@@ -507,6 +656,7 @@ def apply_sync(con: sqlite3.Connection, body: dict, actor: dict | None = None) -
     }
     if actor:
         result["access"] = access_for(con, actor)
+        _note_access(con)
     return result
 
 
@@ -515,30 +665,24 @@ def _upsert_library(con, item, device_id, device_name, actor=None, grants=None):
     base_rev = int(item["base_rev"])
     grants = grants or []
     if actor and not actor.get("is_admin"):
-        if row is None:
-            if not _can(actor, grants, "*", "library", "create"):
-                return "forbidden", "You cannot create libraries"
-        elif item.get("deleted"):
-            if not _can(actor, grants, row["id"], "library", "erase", row["created_by"]):
-                return "forbidden", "You cannot erase this library"
-        elif not _can(actor, grants, row["id"], "library", "edit", row["created_by"]):
-            return "forbidden", "You cannot edit this library"
+        return "forbidden", "Only an admin can change libraries"
     if row is not None and int(row["rev"]) != base_rev:
-        projected = _project_library(library_out(row), actor, grants)
+        projected = _project_library(library_out(row), actor, grants, con)
         return "conflict", projected or {"kind": "library", "id": row["id"], "rev": int(row["rev"])}
     seq = bump(con)
     rev = 1 if row is None else int(row["rev"]) + 1
     fields = json.dumps(item["fields"])
     deleted = 1 if item.get("deleted") else 0
+    access_json = json.dumps(_clean_access(item.get("access") if "access" in item else _parse_access(row["access_json"] if row is not None and "access_json" in row.keys() else None)))
     if row is None:
         created_by = actor["id"] if actor else (item.get("created_by") or device_id)
         con.execute(
             """
             INSERT INTO libraries
-                (id, name, fields_json, rev, updated_at, deleted, change_seq, updated_by, updated_by_name, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, name, fields_json, rev, updated_at, deleted, change_seq, updated_by, updated_by_name, created_by, access_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (item["id"], item["name"], fields, rev, item["updated_at"], deleted, seq, device_id, device_name, created_by),
+            (item["id"], item["name"], fields, rev, item["updated_at"], deleted, seq, device_id, device_name, created_by, access_json),
         )
         if actor and not actor.get("is_admin"):
             _creator_grants(con, actor["id"], item["id"])
@@ -547,34 +691,35 @@ def _upsert_library(con, item, device_id, device_name, actor=None, grants=None):
             """
             UPDATE libraries
                SET name = ?, fields_json = ?, rev = ?, updated_at = ?, deleted = ?,
-                   change_seq = ?, updated_by = ?, updated_by_name = ?
+                   change_seq = ?, updated_by = ?, updated_by_name = ?, access_json = ?
              WHERE id = ?
             """,
-            (item["name"], fields, rev, item["updated_at"], deleted, seq, device_id, device_name, item["id"]),
+            (item["name"], fields, rev, item["updated_at"], deleted, seq, device_id, device_name, access_json, item["id"]),
         )
     return "accepted", rev
 
 
-def _merge_entry_values(row, item, actor, grants):
+def _merge_entry_values(row, item, actor, grants, library=None):
     current = json.loads(row["values_json"]) if row is not None else {}
     incoming = item.get("values") or {}
     if actor is None or actor.get("is_admin") or row is None:
         return incoming, None
     merged = dict(current)
     created_by = row["created_by"]
-    library_id = row["library_id"]
     for field_id, cell in incoming.items():
         previous = current.get(field_id)
         if _same_cell(previous, cell):
             merged[field_id] = previous if previous is not None else cell
             continue
-        if not _can(actor, grants, library_id, "field", "edit", created_by, field_id):
+        field = _field_by_id(library, field_id)
+        if not _entry_allowed(actor, grants, library, "edit", created_by, current, field):
             return None, "You cannot edit that field"
         merged[field_id] = cell
     for field_id in list(merged):
         if field_id in incoming:
             continue
-        if _can(actor, grants, library_id, "field", "edit", created_by, field_id):
+        field = _field_by_id(library, field_id)
+        if _entry_allowed(actor, grants, library, "edit", created_by, current, field):
             del merged[field_id]
     return merged, None
 
@@ -583,23 +728,26 @@ def _upsert_entry(con, item, device_id, device_name, actor=None, grants=None):
     row = con.execute("SELECT * FROM entries WHERE id = ?", (item["id"],)).fetchone()
     base_rev = int(item["base_rev"])
     grants = grants or []
+    library = _library_by_id(con, row["library_id"] if row is not None else item["library_id"])
     if actor and not actor.get("is_admin"):
         if row is None:
-            if not _can(actor, grants, item["library_id"], "entry", "create"):
+            if not _entry_allowed(actor, grants, library, "create", None, item.get("values") or {}):
                 return "forbidden", "You cannot create entries here"
         elif item.get("deleted") and not row["deleted"]:
-            if not _can(actor, grants, row["library_id"], "entry", "erase", row["created_by"]):
+            current = json.loads(row["values_json"])
+            if not _entry_allowed(actor, grants, library, "erase", row["created_by"], current):
                 return "forbidden", "You cannot erase this entry"
         elif not item.get("deleted"):
-            if not _can(actor, grants, row["library_id"], "entry", "see", row["created_by"]):
+            current = json.loads(row["values_json"])
+            if not _entry_allowed(actor, grants, library, "see", row["created_by"], current):
                 return "forbidden", "You cannot see this entry"
-            _, field_error = _merge_entry_values(row, item, actor, grants)
+            _, field_error = _merge_entry_values(row, item, actor, grants, library)
             if field_error:
                 return "forbidden", field_error
     if row is not None and int(row["rev"]) != base_rev:
-        projected = _project_entry(entry_out(row), actor, grants)
+        projected = _project_entry(entry_out(row), actor, grants, library)
         return "conflict", projected or {"kind": "entry", "id": row["id"], "rev": int(row["rev"])}
-    values, _ = _merge_entry_values(row, item, actor, grants)
+    values, _ = _merge_entry_values(row, item, actor, grants, library)
     if values is None:
         values = item["values"]
     seq = bump(con)
@@ -656,30 +804,56 @@ def _values_differ(row, item) -> bool:
     return any(not _same_cell(current.get(key), incoming.get(key)) for key in keys)
 
 
-def _project_library(data: dict, actor, grants) -> dict | None:
+def _library_by_id(con, library_id: str):
+    row = con.execute("SELECT * FROM libraries WHERE id = ?", (library_id,)).fetchone()
+    return library_out(row) if row else None
+
+
+def _field_hidden(actor, grants, library_id: str, field_id: str) -> bool:
+    specific = [
+        grant
+        for grant in grants
+        if (grant["subject_type"], grant["subject_id"]) in _subjects(actor)
+        and grant["library_id"] in (library_id, "*")
+        and grant["target"] == "field"
+        and (grant["field_id"] or "") == field_id
+    ]
+    if not specific:
+        return False
+    return all(_level(grant.get("see") or "none", "see") == "none" for grant in specific)
+
+
+def _project_library(data: dict, actor, grants, con=None) -> dict | None:
     if actor is None:
         return data
-    fake = {"id": data["id"], "created_by": data.get("created_by")}
-    if not _can_see_library(actor, grants, fake):
+    fake = {"id": data["id"], "created_by": data.get("created_by"), "access": data.get("access")}
+    visible = _can_see_library(actor, grants, fake)
+    if not visible and con is not None and not actor.get("is_admin"):
+        for row in con.execute("SELECT * FROM entries WHERE library_id = ? AND deleted = 0", (data["id"],)):
+            entry = entry_out(row)
+            if _entry_allowed(actor, grants, data, "see", entry.get("created_by"), entry.get("values")):
+                visible = True
+                break
+    if not visible:
         return None
-    if not _can(actor, grants, data["id"], "library", "edit", data.get("created_by")):
+    if not actor.get("is_admin"):
         data["fields"] = [
             field
             for field in data.get("fields") or []
-            if _field_level(actor, grants, data["id"], field["id"], "see", _best_level(actor, grants, data["id"], "entry", "see")) != "none"
+            if not _field_hidden(actor, grants, data["id"], field.get("id") or "")
         ]
     return data
 
 
-def _project_entry(data: dict, actor, grants) -> dict | None:
+def _project_entry(data: dict, actor, grants, library=None) -> dict | None:
     if actor is None:
         return data
-    if not _can(actor, grants, data["library_id"], "entry", "see", data.get("created_by")):
+    values_in = data.get("values") or {}
+    if not _entry_allowed(actor, grants, library, "see", data.get("created_by"), values_in):
         return None
-    entry_see = _best_level(actor, grants, data["library_id"], "entry", "see")
     values = {}
-    for field_id, cell in (data.get("values") or {}).items():
-        if _allows(_field_level(actor, grants, data["library_id"], field_id, "see", entry_see), data.get("created_by"), actor["id"], "see"):
+    for field_id, cell in values_in.items():
+        if actor.get("is_admin") or not _field_hidden(actor, grants, data["library_id"], field_id):
             values[field_id] = cell
     data["values"] = values
     return data
@@ -701,13 +875,167 @@ def _changes_since(con: sqlite3.Connection, cursor: int, actor=None, grants=None
         return changes, []
     visible = []
     hidden = []
+    seen_libraries = set()
     for change in changes:
-        projected = _project_library(dict(change), actor, grants) if change["kind"] == "library" else _project_entry(dict(change), actor, grants)
+        if change["kind"] == "library":
+            projected = _project_library(dict(change), actor, grants, con)
+        else:
+            projected = _project_entry(dict(change), actor, grants, _library_by_id(con, change["library_id"]))
         if projected is None:
             hidden.append(change)
         else:
             visible.append(projected)
+            if projected["kind"] == "library":
+                seen_libraries.add(projected["id"])
+    # A person added to "who can see" must receive the library even when that
+    # library changed before their cursor. Otherwise the entry arrives alone
+    # and the library list stays empty.
+    extras = []
+    for item in visible:
+        if item.get("kind") != "entry" or item.get("library_id") in seen_libraries:
+            continue
+        library = _library_by_id(con, item["library_id"])
+        if not library or library.get("deleted"):
+            continue
+        projected = _project_library(dict(library), actor, grants, con)
+        if projected is None:
+            continue
+        extras.append(projected)
+        seen_libraries.add(projected["id"])
+    if extras:
+        visible = extras + visible
     return visible, hidden
+
+
+def _setting(con, key: str, default: str = "") -> str:
+    row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def _put_setting(con, key: str, value: str) -> None:
+    con.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+def backup_settings(con) -> dict:
+    mode = _setting(con, "backup_mode", "off")
+    if mode not in {"off", "hours", "accesses"}:
+        mode = "off"
+    try:
+        every = max(1, int(_setting(con, "backup_every", "24")))
+    except ValueError:
+        every = 24
+    return {"mode": mode, "every": every, "last_at": _setting(con, "backup_last", ""), "accesses": int(_setting(con, "backup_accesses", "0") or 0)}
+
+
+def save_backup_settings(con, mode: str, every: int) -> dict:
+    if mode not in {"off", "hours", "accesses"}:
+        raise ValueError("Choose off, hours, or accesses")
+    if every < 1:
+        raise ValueError("Use a number of at least 1")
+    _put_setting(con, "backup_mode", mode)
+    _put_setting(con, "backup_every", str(int(every)))
+    return backup_settings(con)
+
+
+def _note_access(con) -> None:
+    settings = backup_settings(con)
+    count = settings["accesses"] + 1
+    _put_setting(con, "backup_accesses", str(count))
+    if settings["mode"] == "accesses" and count % settings["every"] == 0:
+        _write_backup(con)
+
+
+def maybe_backup_by_time(con) -> None:
+    settings = backup_settings(con)
+    if settings["mode"] != "hours":
+        return
+    last = settings["last_at"]
+    if last:
+        try:
+            previous = time.strptime(last, "%Y-%m-%dT%H:%M:%SZ")
+            elapsed = time.time() - time.mktime(previous)
+        except ValueError:
+            elapsed = settings["every"] * 3600
+    else:
+        elapsed = settings["every"] * 3600
+    if elapsed >= settings["every"] * 3600:
+        _write_backup(con)
+
+
+def _write_backup(con) -> None:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    folder = BACKUP_DIR / stamp
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = sqlite3.connect(folder / "cloud.sqlite")
+    try:
+        con.backup(dest)
+    finally:
+        dest.close()
+    if BLOB_DIR.exists():
+        shutil.copytree(BLOB_DIR, folder / "blobs", dirs_exist_ok=True)
+    _put_setting(con, "backup_last", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    _put_setting(con, "backup_accesses", "0")
+    folders = sorted(path for path in BACKUP_DIR.iterdir() if path.is_dir())
+    for old in folders[:-5]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _backup_loop() -> None:
+    while True:
+        time.sleep(60)
+        try:
+            with LOCK:
+                con = connect()
+                try:
+                    maybe_backup_by_time(con)
+                    con.commit()
+                finally:
+                    con.close()
+        except Exception:
+            continue
+
+
+def _save_blob(con, actor, blob_id: str, name: str, mime: str, payload: bytes, entry_id: str, field_id: str) -> None:
+    if not blob_id or not payload:
+        raise ValueError("Missing file")
+    if len(payload) > MAX_BLOB:
+        raise ValueError("File is larger than 12 MB")
+    BLOB_DIR.mkdir(parents=True, exist_ok=True)
+    target = (BLOB_DIR / blob_id).resolve()
+    if target.parent != BLOB_DIR.resolve():
+        raise ValueError("Bad file id")
+    target.write_bytes(payload)
+    con.execute(
+        """
+        INSERT INTO blobs (id, entry_id, field_id, name, mime, size, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            entry_id = excluded.entry_id,
+            field_id = excluded.field_id,
+            name = excluded.name,
+            mime = excluded.mime,
+            size = excluded.size
+        """,
+        (blob_id, entry_id, field_id, name or "file", mime or "application/octet-stream", len(payload), actor["id"] if actor else "", _now()),
+    )
+
+
+def _blob_visible(con, actor, row) -> bool:
+    if actor is None:
+        return False
+    if actor.get("is_admin") or row["created_by"] == actor["id"]:
+        return True
+    if not row["entry_id"]:
+        return False
+    entry = con.execute("SELECT * FROM entries WHERE id = ?", (row["entry_id"],)).fetchone()
+    if entry is None:
+        return False
+    library = _library_by_id(con, entry["library_id"])
+    return _entry_allowed(actor, load_grants(con), library, "see", entry["created_by"], json.loads(entry["values_json"]))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -735,6 +1063,12 @@ class Handler(BaseHTTPRequestHandler):
             library_id = (parse_qs(parsed.query).get("library_id") or [""])[0]
             self._authed(lambda con, actor: self._grants(con, actor, library_id), admin=True)
             return
+        if path == "/api/backup":
+            self._authed(lambda con, actor: backup_settings(con), admin=True)
+            return
+        if path.startswith("/api/blobs/"):
+            self._send_blob(path.removeprefix("/api/blobs/"))
+            return
         if path in ("/", "/index.html"):
             self._file(ROOT / "static" / "index.html", "text/html; charset=utf-8")
             return
@@ -752,6 +1086,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/blobs":
+            self._post_blob()
+            return
         body = self._read_json()
         if body is None:
             return
@@ -766,6 +1103,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/grants": self._save_grants,
             "/api/creators": self._save_creators,
             "/api/sync": self._sync,
+            "/api/backup": self._save_backup,
         }
         handler = routes.get(path)
         if handler is None:
@@ -891,6 +1229,99 @@ class Handler(BaseHTTPRequestHandler):
         set_library_creators(con, body.get("subjects") or [])
         return {"ok": True}
 
+    def _save_backup(self, con, actor, body):
+        self._admin(actor)
+        return save_backup_settings(con, body.get("mode") or "off", int(body.get("every") or 1))
+
+    def _post_blob(self) -> None:
+        form = self._read_form()
+        if not form or "file" not in form:
+            self._json(400, {"error": "Missing file"})
+            return
+        with LOCK:
+            con = connect()
+            try:
+                actor = actor_from_token(con, self._bearer())
+                if actor is None:
+                    raise PermissionError("Sign in first")
+                def text(name):
+                    return (form.get(name, {}).get("data") or b"").decode("utf-8", "replace")
+                uploaded = form["file"]
+                _save_blob(
+                    con,
+                    actor,
+                    text("id"),
+                    uploaded.get("filename") or text("name") or "file",
+                    uploaded.get("type") or "application/octet-stream",
+                    uploaded.get("data") or b"",
+                    text("entry_id"),
+                    text("field_id"),
+                )
+                con.commit()
+            except PermissionError as exc:
+                con.rollback()
+                self._json(401, {"error": str(exc)})
+                return
+            except ValueError as exc:
+                con.rollback()
+                self._json(400, {"error": str(exc)})
+                return
+            finally:
+                con.close()
+        self._json(200, {"ok": True})
+
+    def _send_blob(self, blob_id: str) -> None:
+        with LOCK:
+            con = connect()
+            try:
+                actor = actor_from_token(con, self._bearer())
+                if actor is None:
+                    self._json(401, {"error": "Sign in first"})
+                    return
+                row = con.execute("SELECT * FROM blobs WHERE id = ?", (blob_id,)).fetchone()
+                if row is None or not _blob_visible(con, actor, row):
+                    self._json(404, {"error": "not found"})
+                    return
+                target = (BLOB_DIR / blob_id).resolve()
+                if target.parent != BLOB_DIR.resolve() or not target.is_file():
+                    self._json(404, {"error": "not found"})
+                    return
+                data = target.read_bytes()
+                mime = row["mime"] or "application/octet-stream"
+                name = (row["name"] or "file").replace('"', "")
+            finally:
+                con.close()
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'inline; filename="{name}"')
+        self.send_header("Cache-Control", "private")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_form(self):
+        from email.parser import BytesParser
+        from email.policy import default
+        ctype = self.headers.get("Content-Type") or ""
+        if "multipart/form-data" not in ctype.lower():
+            return None
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        message = BytesParser(policy=default).parsebytes(
+            f"Content-Type: {ctype}\r\nMIME-Version: 1.0\r\n\r\n".encode() + body
+        )
+        fields = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            fields[name] = {
+                "filename": part.get_filename(),
+                "type": part.get_content_type(),
+                "data": part.get_payload(decode=True) or b"",
+            }
+        return fields
+
     def _sync(self, con, actor, body):
         if actor is None:
             raise PermissionError("Sign in first")
@@ -988,8 +1419,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     init_db(DB_PATH)
+    threading.Thread(target=_backup_loop, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Cafinewo is running at http://{HOST}:{PORT}")
+    print(f"Cafineuos is running at http://{HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

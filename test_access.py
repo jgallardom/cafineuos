@@ -228,7 +228,7 @@ class AccessTests(unittest.TestCase):
                 "updated_at": "2026-09-28T00:00:00Z",
             }],
         })
-        self.assertEqual(blocked["forbidden"][0]["error"], "You cannot create libraries")
+        self.assertEqual(blocked["forbidden"][0]["error"], "Only an admin can change libraries")
         server.set_library_creators(self.con, [{"subject_type": "user", "subject_id": self.ana["id"]}])
         self.con.commit()
         created = self.sync(self.ana, {
@@ -241,8 +241,109 @@ class AccessTests(unittest.TestCase):
                 "updated_at": "2026-09-28T00:00:00Z",
             }],
         })
-        self.assertEqual(created["accepted"][0]["rev"], 1)
-        self.assertTrue(created["access"]["grants"])
+        self.assertEqual(created["forbidden"][0]["error"], "Only an admin can change libraries")
+
+    def test_viewers_and_library_lists(self):
+        self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "tasks",
+                "name": "Tasks",
+                "fields": [
+                    {"id": "title", "name": "Title", "type": "text", "viewer_edit": True},
+                    {"id": "see", "name": "Who can see", "type": "users", "role": "viewers"},
+                    {"id": "edit", "name": "Who can modify", "type": "users", "role": "editors"},
+                ],
+                "access": {
+                    "create": {"mode": "list", "users": [self.ana["id"]]},
+                    "edit": {"mode": "none", "users": []},
+                    "erase": {"mode": "list", "users": [self.bo["id"]]},
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+        })
+        blocked = self.sync(self.bo, {
+            "cursor": 0,
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {"title": cell("Gate"), "see": cell([self.bo["id"]])},
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:01:00Z",
+            }],
+        })
+        self.assertEqual(blocked["forbidden"][0]["error"], "You cannot create entries here")
+        made = self.sync(self.ana, {
+            "cursor": 0,
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {
+                    "title": cell("Gate"),
+                    "see": cell([self.bo["id"]]),
+                    "edit": cell([self.bo["id"]]),
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:02:00Z",
+            }],
+        })
+        self.assertTrue(made["accepted"])
+        rev = made["accepted"][0]["rev"]
+        hidden = self.sync(self.bo, {"cursor": 0, "entries": []})
+        visible = next(item for item in hidden["changes"] if item["id"] == "task1")
+        self.assertEqual(visible["values"]["title"]["v"], "Gate")
+        outsider = self.sync(self.person("Cia", "cia-pass", False), {"cursor": 0, "entries": []})
+        self.assertNotIn("task1", {item["id"] for item in outsider["changes"] if item["kind"] == "entry"})
+        edited = self.sync(self.bo, {
+            "cursor": hidden["cursor"],
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {"title": cell("Gate today"), "see": cell([self.bo["id"]]), "edit": cell([self.bo["id"]])},
+                "base_rev": rev,
+                "updated_at": "2026-09-28T00:03:00Z",
+            }],
+        })
+        self.assertTrue(edited["accepted"])
+
+    def test_viewer_added_later_still_receives_the_library(self):
+        self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "tasks",
+                "name": "Tasks",
+                "fields": [
+                    {"id": "title", "name": "Title", "type": "text"},
+                    {"id": "see", "name": "Who can see", "type": "users", "role": "viewers"},
+                ],
+                "access": {
+                    "create": {"mode": "none", "users": []},
+                    "edit": {"mode": "none", "users": []},
+                    "erase": {"mode": "none", "users": []},
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+        })
+        first = self.sync(self.bo, {"cursor": 0})
+        self.assertNotIn("tasks", {item["id"] for item in first["changes"]})
+        self.assertIn("tasks", {item["id"] for item in first["hidden"]})
+        made = self.sync(self.admin, {
+            "cursor": first["cursor"],
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {"title": cell("Gate"), "see": cell([self.bo["id"]])},
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:02:00Z",
+            }],
+        })
+        self.assertTrue(made["accepted"])
+        second = self.sync(self.bo, {"cursor": first["cursor"]})
+        ids = {item["id"] for item in second["changes"]}
+        self.assertIn("task1", ids)
+        self.assertIn("tasks", ids)
 
     def person_existing(self, user_id):
         row = self.con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()

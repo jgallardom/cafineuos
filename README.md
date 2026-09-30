@@ -1,4 +1,4 @@
-# Cafinewo
+# Cafineuos
 
 Offline-first database, in the spirit of Memento: libraries, typed fields, and entries. Changes are saved on the device immediately. When a connection is available they sync, and edits that touch the same field are resolved by you.
 
@@ -12,14 +12,23 @@ python3 server.py
 
 Open http://127.0.0.1:8765
 
-The first visit asks for an admin name and password. That account can add users and groups, choose who may create libraries, and set access on each library.
+The first visit asks for an admin name and password. Admins create, edit, and delete libraries, and they manage users. On each library they choose who can create, edit, or delete entries: None, All, Own, or a list of users.
 
-Access is per library, for a user or a group:
+Each entry has people fields for who can see it and who can modify it. The person who created the entry can still see it. A field can be marked so that anyone who can see the entry may edit that field.
 
-- See, edit, create, and erase can be turned on separately for the library and for its entries.
-- Each field can follow the entry rule, or be hidden or locked on its own.
-- Own means only records that person created. A group member with Own sees the entries they created, not the rest of the group.
-- If a person also belongs to a group, the wider permission applies. A group set to All lets every member see every entry.
+Field types include text, date, time, single choice, multiple choice, image, and file. Files stay on the phone and upload with the next sync.
+
+People, on an admin account, sets backups every N hours or every N syncs. The server keeps the last five copies.
+
+## Hosting
+
+Render can run this server. Push the repo, then New > Blueprint and pick `render.yaml`.
+
+The Blueprint uses a Starter instance (about $7 a month) and a 1 GB disk (about $0.25 a month). The disk keeps accounts, libraries, uploaded files, and backups. A free instance has no disk, so that data disappears whenever Render restarts the service.
+
+After the first deploy, open the URL and create the admin account. Phones load the same URL, work offline after that, and sync when they are online.
+
+When files grow, keep the app on Render and put `blobs/` in Cloudflare R2 or Backblaze B2.
 
 ## Try a conflict
 

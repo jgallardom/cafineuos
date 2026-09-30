@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: cafineuos
+    runtime: python
+    plan: starter
+    buildCommand: "true"
+    startCommand: python3 server.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: cafineuos-data
+      mountPath: /var/data
+      sizeGB: 1
