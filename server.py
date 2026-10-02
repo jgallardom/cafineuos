@@ -421,13 +421,19 @@ def _ids_in_value(values, field_id: str) -> set[str]:
     return set()
 
 
+def _fields_for_role(library, role: str) -> list[dict]:
+    fields = (library or {}).get("fields") or []
+    matched = [field for field in fields if field.get("role") == role]
+    if matched or role != "viewers":
+        return matched
+    return [field for field in fields if field.get("type") == "users" and not field.get("role")]
+
+
 def _role_ids(library, values, role: str) -> set[str]:
-    if not library:
-        return set()
-    for field in library.get("fields") or []:
-        if field.get("role") == role:
-            return _ids_in_value(values, field.get("id") or "")
-    return set()
+    found: set[str] = set()
+    for field in _fields_for_role(library, role):
+        found |= _ids_in_value(values, field.get("id") or "")
+    return found
 
 
 def _field_by_id(library, field_id: str):
@@ -696,6 +702,7 @@ def _upsert_library(con, item, device_id, device_name, actor=None, grants=None):
             """,
             (item["name"], fields, rev, item["updated_at"], deleted, seq, device_id, device_name, access_json, item["id"]),
         )
+    _touch_library(con, item["id"])
     return "accepted", rev
 
 
@@ -902,6 +909,32 @@ def _changes_since(con: sqlite3.Connection, cursor: int, actor=None, grants=None
             continue
         extras.append(projected)
         seen_libraries.add(projected["id"])
+    # Tasks already behind this phone's cursor stay invisible if they were
+    # hidden on an earlier sync. Send the ones this person can see now.
+    if actor is not None:
+        seen_entries = {item["id"] for item in visible if item.get("kind") == "entry"}
+        for row in con.execute(
+            "SELECT * FROM entries WHERE deleted = 0 AND change_seq <= ? ORDER BY change_seq",
+            (cursor,),
+        ):
+            entry = entry_out(row)
+            if entry["id"] in seen_entries:
+                continue
+            library = _library_by_id(con, entry["library_id"])
+            projected = _project_entry(dict(entry), actor, grants, library)
+            if projected is None:
+                continue
+            visible.append(projected)
+            seen_entries.add(projected["id"])
+            if projected.get("library_id") in seen_libraries:
+                continue
+            if not library or library.get("deleted"):
+                continue
+            library_view = _project_library(dict(library), actor, grants, con)
+            if library_view is None:
+                continue
+            extras.append(library_view)
+            seen_libraries.add(library_view["id"])
     if extras:
         visible = extras + visible
     return visible, hidden

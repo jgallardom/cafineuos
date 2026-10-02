@@ -16,6 +16,51 @@ const state = {
   previews: {},
 };
 
+const memoryStore = {};
+let storageBlocked = false;
+
+function siteStore() {
+  try {
+    return window.localStorage;
+  } catch (error) {
+    storageBlocked = true;
+    return null;
+  }
+}
+
+function stored(key) {
+  const box = siteStore();
+  if (!box) return Object.prototype.hasOwnProperty.call(memoryStore, key) ? memoryStore[key] : null;
+  try {
+    return box.getItem(key);
+  } catch (error) {
+    storageBlocked = true;
+    return Object.prototype.hasOwnProperty.call(memoryStore, key) ? memoryStore[key] : null;
+  }
+}
+
+function storeSet(key, value) {
+  memoryStore[key] = value;
+  const box = siteStore();
+  if (!box) return;
+  try {
+    box.setItem(key, value);
+  } catch (error) {
+    storageBlocked = true;
+  }
+}
+
+function storeDrop(key) {
+  delete memoryStore[key];
+  const box = siteStore();
+  if (!box) return;
+  try {
+    box.removeItem(key);
+  } catch (error) {
+    storageBlocked = true;
+  }
+}
+
 let dbPromise = null;
 let syncing = false;
 let syncQueued = false;
@@ -47,42 +92,42 @@ function esc(value) {
 }
 
 function devices() {
-  const raw = localStorage.getItem("cafinewo.devices");
+  const raw = stored("cafinewo.devices");
   if (!raw) {
     const first = { id: uuid(), name: "Field phone" };
-    localStorage.setItem("cafinewo.devices", JSON.stringify([first]));
-    localStorage.setItem("cafinewo.active", first.id);
+    storeSet("cafinewo.devices", JSON.stringify([first]));
+    storeSet("cafinewo.active", first.id);
     return [first];
   }
   return JSON.parse(raw);
 }
 
 function saveDevices(list) {
-  localStorage.setItem("cafinewo.devices", JSON.stringify(list));
+  storeSet("cafinewo.devices", JSON.stringify(list));
 }
 
 function device() {
   const list = devices();
-  const active = localStorage.getItem("cafinewo.active");
+  const active = stored("cafinewo.active");
   return list.find((item) => item.id === active) || list[0];
 }
 
 function isOnline() {
-  return navigator.onLine && localStorage.getItem("cafinewo.offline") !== "1";
+  return navigator.onLine && stored("cafinewo.offline") !== "1";
 }
 
 function loadSession() {
   try {
-    return JSON.parse(localStorage.getItem("cafinewo.session") || "null");
+    return JSON.parse(stored("cafinewo.session") || "null");
   } catch (error) {
     return null;
   }
 }
 
 function saveSession() {
-  localStorage.setItem("cafinewo.session", JSON.stringify(state.session));
+  storeSet("cafinewo.session", JSON.stringify(state.session));
   if (state.access && state.session?.user) {
-    localStorage.setItem("cafinewo.access." + state.session.user.id, JSON.stringify(state.access));
+    storeSet("cafinewo.access." + state.session.user.id, JSON.stringify(state.access));
   }
 }
 
@@ -148,11 +193,21 @@ function ruleOk(rule, createdBy) {
   return false;
 }
 
+function fieldsForRole(library, role) {
+  const fields = library?.fields || [];
+  const matched = fields.filter((field) => field.role === role);
+  if (matched.length || role !== "viewers") return matched;
+  return fields.filter((field) => field.type === "users" && !field.role);
+}
+
 function roleIds(library, values, role) {
-  const field = (library?.fields || []).find((item) => item.role === role);
-  const raw = field ? values?.[field.id]?.v : null;
-  if (Array.isArray(raw)) return raw.map(String);
-  return [];
+  const ids = [];
+  for (const field of fieldsForRole(library, role)) {
+    const raw = values?.[field.id]?.v;
+    if (Array.isArray(raw)) ids.push(...raw.map(String));
+    else if (raw) ids.push(String(raw));
+  }
+  return ids;
 }
 
 function canSeeEntry(library, entry) {
@@ -227,7 +282,7 @@ async function signOut(tellServer) {
   state.directory = null;
   state.permRows = [];
   state.query = "";
-  localStorage.removeItem("cafinewo.session");
+  storeDrop("cafinewo.session");
   if (tellServer && token) {
     await fetch("/api/logout", {
       method: "POST",
@@ -247,7 +302,14 @@ function dbName() {
 function openDb() {
   const name = dbName();
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(name, 2);
+    let request;
+    try {
+      request = indexedDB.open(name, 2);
+    } catch (error) {
+      storageBlocked = true;
+      reject(error);
+      return;
+    }
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta");
@@ -259,7 +321,10 @@ function openDb() {
       }
     };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onerror = () => {
+      if (request.error?.name === "SecurityError") storageBlocked = true;
+      reject(request.error);
+    };
   });
 }
 
@@ -427,17 +492,22 @@ function fieldName(library, fieldId) {
   return library?.fields?.find((field) => field.id === fieldId)?.name || "Field";
 }
 
-function notice(message, warn) {
+function notice(message, warn, sticky) {
   const el = document.getElementById("notice");
   el.hidden = !message;
   el.className = warn ? "warn" : "";
   el.textContent = message || "";
-  if (message) {
-    clearTimeout(notice.timer);
+  clearTimeout(notice.timer);
+  if (message && !sticky) {
     notice.timer = setTimeout(() => {
       el.hidden = true;
     }, 2800);
   }
+}
+
+function storageNotice() {
+  if (!storageBlocked) return;
+  notice("This phone is blocking saved site data. Allow cookies for this site, or open it in Chrome or Safari.", true, true);
 }
 
 function render() {
@@ -481,7 +551,7 @@ function renderHeader() {
   document.getElementById("open-devices").onclick = () => go("devices");
   document.getElementById("sync").onclick = () => sync();
   document.getElementById("offline").onchange = (event) => {
-    localStorage.setItem("cafinewo.offline", event.target.checked ? "1" : "0");
+    storeSet("cafinewo.offline", event.target.checked ? "1" : "0");
     renderHeader();
     if (isOnline()) sync();
   };
@@ -520,7 +590,7 @@ function librariesHtml() {
   const cards = libraries.length
     ? `<div class="list">${libraries
         .map((library) => {
-          const count = state.entries.filter((entry) => entry.library_id === library.id && !entry.deleted).length;
+          const count = state.entries.filter((entry) => entry.library_id === library.id && !entry.deleted && canSeeEntry(library, entry)).length;
           const waiting = library.dirty || state.entries.some((entry) => entry.library_id === library.id && entry.dirty);
           return `<button class="row" data-open-library="${library.id}" type="button">
             <span><strong>${esc(library.name)}</strong><span>${count} entr${count === 1 ? "y" : "ies"}</span></span>
@@ -545,7 +615,7 @@ function groupStorageKey(libraryId) {
 function selectedGroupFields(library) {
   let ids = [];
   try {
-    const raw = JSON.parse(localStorage.getItem(groupStorageKey(library.id)) || "[]");
+    const raw = JSON.parse(stored(groupStorageKey(library.id)) || "[]");
     if (Array.isArray(raw)) ids = raw.map(String);
   } catch (error) {
     ids = [];
@@ -556,7 +626,7 @@ function selectedGroupFields(library) {
 }
 
 function saveGroupFields(libraryId, ids) {
-  localStorage.setItem(groupStorageKey(libraryId), JSON.stringify(ids));
+  storeSet(groupStorageKey(libraryId), JSON.stringify(ids));
 }
 
 function groupLabel(field, entry) {
@@ -599,7 +669,7 @@ function groupSectionsHtml(library, entries, fields, depth) {
 
 function entriesBlockHtml(library, entries) {
   if (!entries.length) {
-    return `<div class="empty">${state.query.trim() ? "No matching entries." : "No entries yet."}</div>`;
+    return `<div class="empty">${state.query.trim() ? "No matching entries." : "No entries you can see yet."}</div>`;
   }
   const fields = selectedGroupFields(library);
   if (!fields.length) return entries.map((entry) => entryRowHtml(library, entry)).join("");
@@ -1339,7 +1409,7 @@ async function switchDevice(id) {
     notice("Already on this device.");
     return;
   }
-  localStorage.setItem("cafinewo.active", id);
+  storeSet("cafinewo.active", id);
   await resetDb();
   state.libraryId = null;
   state.query = "";
@@ -1503,19 +1573,24 @@ async function syncOnce() {
   for (const item of data.accepted || []) await markAccepted(item);
   for (const item of data.forbidden || []) await markForbidden(item);
   let merged = false;
+  let fresh = false;
   for (const conflict of data.conflicts || []) {
     if (await handleConflict(conflict.kind, conflict.id, conflict.server)) merged = true;
   }
   for (const change of data.changes || []) {
     if (accepted.has(`${change.kind}:${change.id}`)) continue;
+    const store = change.kind === "library" ? "libraries" : "entries";
+    const before = await getOne(store, change.id);
+    const unchanged = before && !before.dirty && !before.conflict && before.rev === change.rev && !!before.deleted === !!change.deleted;
     if (await applyRemote(change)) merged = true;
+    if (!unchanged) fresh = true;
   }
   for (const item of data.hidden || []) {
     if (!accepted.has(`${item.kind}:${item.id}`)) await hideRemote(item);
   }
   await putOne("meta", data.cursor, "cursor");
   if ((data.forbidden || []).length) notice(data.forbidden[0].error, true);
-  else if ((data.accepted || []).length || (data.changes || []).length || (data.conflicts || []).length) {
+  else if ((data.accepted || []).length || fresh || (data.conflicts || []).length) {
     const left = (await getAll("entries")).filter((row) => row.conflict).length
       + (await getAll("libraries")).filter((row) => row.conflict).length;
     if (left) notice(`${left} conflict${left === 1 ? "" : "s"} to resolve`, true);
@@ -1598,6 +1673,9 @@ async function handleConflict(kind, id, remote) {
 async function applyRemote(change) {
   const store = change.kind === "library" ? "libraries" : "entries";
   const local = await getOne(store, change.id);
+  if (local && !local.dirty && !local.conflict && local.rev === change.rev && !!local.deleted === !!change.deleted) {
+    return false;
+  }
   if (!local) {
     await putOne(store, change.kind === "library" ? fromRemoteLibrary(change) : fromRemoteEntry(change));
     return false;
@@ -1714,6 +1792,7 @@ async function start() {
   }
   if (!state.session) {
     renderAuth();
+    storageNotice();
     return;
   }
   try {
@@ -1723,10 +1802,19 @@ async function start() {
     saveSession();
   } catch (error) {
     if (error.message === "signed out") return;
-    const cached = localStorage.getItem("cafinewo.access." + state.session.user.id);
+    const cached = stored("cafinewo.access." + state.session.user.id);
     state.access = cached ? JSON.parse(cached) : { user_id: state.session.user.id, is_admin: !!state.session.user.is_admin, grants: [] };
   }
-  await bootApp();
+  try {
+    await bootApp();
+  } catch (error) {
+    if (storageBlocked || error?.name === "SecurityError") {
+      storageBlocked = true;
+    } else {
+      notice(error.message || "Could not open this device's saved data.", true, true);
+    }
+  }
+  storageNotice();
 }
 
 function renderAuth() {

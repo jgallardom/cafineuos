@@ -1,5 +1,6 @@
 """Users, groups, and library permissions."""
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -344,6 +345,84 @@ class AccessTests(unittest.TestCase):
         ids = {item["id"] for item in second["changes"]}
         self.assertIn("task1", ids)
         self.assertIn("tasks", ids)
+
+    def test_encargado_sees_tasks_already_behind_the_cursor(self):
+        self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "tasks",
+                "name": "Tasks",
+                "fields": [
+                    {"id": "title", "name": "Title", "type": "text"},
+                    {"id": "encargado", "name": "Encargado", "type": "users", "role": "editors"},
+                ],
+                "access": {
+                    "create": {"mode": "list", "users": [self.bo["id"]]},
+                    "edit": {"mode": "none", "users": []},
+                    "erase": {"mode": "none", "users": []},
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+        })
+        made = self.sync(self.admin, {
+            "cursor": 0,
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {"title": cell("Gate"), "encargado": cell([self.bo["id"]])},
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:02:00Z",
+            }],
+        })
+        self.assertTrue(made["accepted"])
+        first = self.sync(self.bo, {"cursor": 0})
+        self.assertNotIn("task1", {item["id"] for item in first["changes"] if item["kind"] == "entry" and not item.get("deleted")})
+        self.con.execute(
+            "UPDATE libraries SET fields_json = ? WHERE id = 'tasks'",
+            (json.dumps([
+                {"id": "title", "name": "Title", "type": "text"},
+                {"id": "encargado", "name": "Encargado", "type": "users", "role": "viewers"},
+            ]),),
+        )
+        self.con.commit()
+        second = self.sync(self.bo, {"cursor": first["cursor"]})
+        ids = {item["id"] for item in second["changes"]}
+        self.assertIn("task1", ids)
+        self.assertIn("tasks", ids)
+        task = next(item for item in second["changes"] if item["id"] == "task1")
+        self.assertEqual(task["values"]["title"]["v"], "Gate")
+
+    def test_people_field_shares_the_entry_when_no_viewers_role_is_set(self):
+        self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "tasks",
+                "name": "Tasks",
+                "fields": [
+                    {"id": "title", "name": "Title", "type": "text"},
+                    {"id": "encargado", "name": "Encargado", "type": "users"},
+                ],
+                "access": {
+                    "create": {"mode": "all", "users": []},
+                    "edit": {"mode": "none", "users": []},
+                    "erase": {"mode": "none", "users": []},
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {"title": cell("Gate"), "encargado": cell([self.bo["id"]])},
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:02:00Z",
+            }],
+        })
+        seen = self.sync(self.bo, {"cursor": 0})
+        self.assertIn("task1", {item["id"] for item in seen["changes"] if item["kind"] == "entry"})
+        outsider = self.sync(self.person("Cia", "cia-pass", False), {"cursor": 0})
+        self.assertNotIn("task1", {item["id"] for item in outsider["changes"] if item["kind"] == "entry"})
 
     def person_existing(self, user_id):
         row = self.con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
