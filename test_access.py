@@ -429,5 +429,31 @@ class AccessTests(unittest.TestCase):
         return server._actor_from_row(self.con, row)
 
 
+    def test_admin_can_rename_and_remove_people_and_groups(self):
+        self.con.execute("INSERT INTO groups (id, name) VALUES ('g-bo', 'Crew')")
+        self.con.commit()
+        renamed = server.update_user(self.con, self.admin, {"id": self.bo["id"], "name": "Pocho", "is_admin": False, "group_ids": ["g-bo"]})
+        self.con.commit()
+        self.assertEqual(renamed["name"], "Pocho")
+        self.assertEqual(self.con.execute("SELECT name FROM users WHERE id = ?", (self.bo["id"],)).fetchone()["name"], "Pocho")
+        self.assertEqual(self.con.execute("SELECT group_id FROM group_members WHERE user_id = ?", (self.bo["id"],)).fetchone()["group_id"], "g-bo")
+        account = server.update_account(self.con, self.ana, {"name": "Ana Maria", "password": "ana-new"})
+        self.con.commit()
+        self.assertEqual(account["name"], "Ana Maria")
+        server.open_session(self.con, "Ana Maria", "ana-new")
+        with self.assertRaises(ValueError):
+            server.remove_user(self.con, self.admin, self.admin["id"])
+        server.remove_user(self.con, self.admin, self.bo["id"])
+        self.con.commit()
+        self.assertIsNone(self.con.execute("SELECT 1 FROM users WHERE id = ?", (self.bo["id"],)).fetchone())
+        server.update_group(self.con, self.admin, {"group_id": "g-bo", "name": "Field crew", "user_ids": [self.ana["id"]]})
+        self.con.commit()
+        self.assertEqual(self.con.execute("SELECT name FROM groups WHERE id = 'g-bo'").fetchone()["name"], "Field crew")
+        self.assertEqual(self.con.execute("SELECT user_id FROM group_members WHERE group_id = 'g-bo'").fetchone()["user_id"], self.ana["id"])
+        server.remove_group(self.con, self.admin, "g-bo")
+        self.con.commit()
+        self.assertIsNone(self.con.execute("SELECT 1 FROM groups WHERE id = 'g-bo'").fetchone())
+
+
 if __name__ == "__main__":
     unittest.main()

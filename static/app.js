@@ -544,6 +544,7 @@ function renderHeader() {
         Offline
       </label>
       ${state.access?.is_admin ? '<button id="open-people" class="btn ghost" type="button">People</button>' : ""}
+      <button id="open-account" class="btn ghost" type="button">Account</button>
       <button id="sign-out" class="btn ghost" type="button">Sign out</button>
     </div>
   `;
@@ -557,6 +558,7 @@ function renderHeader() {
   };
   const people = document.getElementById("open-people");
   if (people) people.onclick = () => openPeople();
+  document.getElementById("open-account").onclick = () => go("account");
   document.getElementById("sign-out").onclick = () => signOut(true);
 }
 
@@ -573,6 +575,7 @@ function renderMain() {
   else if (state.screen === "conflicts") main.innerHTML = conflictsHtml();
   else if (state.screen === "devices") main.innerHTML = devicesHtml();
   else if (state.screen === "people") main.innerHTML = peopleHtml();
+  else if (state.screen === "account") main.innerHTML = accountHtml();
   else if (state.screen === "access") main.innerHTML = accessHtml();
   bindMain();
 }
@@ -592,10 +595,11 @@ function librariesHtml() {
         .map((library) => {
           const count = state.entries.filter((entry) => entry.library_id === library.id && !entry.deleted && canSeeEntry(library, entry)).length;
           const waiting = library.dirty || state.entries.some((entry) => entry.library_id === library.id && entry.dirty);
-          return `<button class="row" data-open-library="${library.id}" type="button">
+          const edit = state.access?.is_admin ? `<button class="btn ghost" data-edit-library="${library.id}" type="button">Edit</button>` : "";
+          return `<div class="row-actions"><button class="row" data-open-library="${library.id}" type="button">
             <span><strong>${esc(library.name)}</strong><span>${count} entr${count === 1 ? "y" : "ies"}</span></span>
             ${waiting ? '<i class="dot" title="Waiting to sync"></i>' : ""}
-          </button>`;
+          </button>${edit}</div>`;
         })
         .join("")}</div>`
     : `<div class="empty">${librariesEmptyText()}</div>`;
@@ -701,7 +705,7 @@ function libraryHtml() {
         <h2>${esc(library.name)}</h2>
       </div>
       <div class="actions">
-        ${state.access?.is_admin ? '<button id="edit-fields" class="btn ghost" type="button">Fields</button>' : ""}
+        ${state.access?.is_admin ? '<button id="edit-fields" class="btn ghost" type="button">Edit</button><button id="open-access" class="btn ghost" type="button">Access</button>' : ""}
       </div>
     </div>
     <input id="q" class="search" placeholder="Search entries" value="${esc(state.query)}" />
@@ -739,6 +743,8 @@ function libraryFormHtml() {
               .map(([type, label]) => `<option value="${type}" ${field.type === type ? "selected" : ""}>${label}</option>`)
               .join("")}
           </select>
+          <button class="btn ghost" data-move-field="${index}" data-move="-1" type="button">Up</button>
+          <button class="btn ghost" data-move-field="${index}" data-move="1" type="button">Down</button>
           <button class="btn ghost" data-remove-field="${index}" type="button">Remove</button>
         </div>
         ${options}
@@ -750,13 +756,15 @@ function libraryFormHtml() {
     <div class="screen-head">
       <div>
         <button class="back" id="back" type="button">Back</button>
-        <h2>${draft.id ? "Fields" : "New library"}</h2>
+        <h2>${draft.id ? "Edit library" : "New library"}</h2>
       </div>
     </div>
     <div class="stack">
       <label class="field">Library name
         <input id="lib-name" value="${esc(draft.name)}" />
       </label>
+      <h2>Fields</h2>
+      <p class="lede">This is the structure of every entry. Add a field, change its type, move it, or remove it. Title stays first.</p>
       ${fields}
       <h2>Who can use entries</h2>
       <p class="lede">None, All, Own, or a list of users. Own means the person who created the entry. Admins can always do this.</p>
@@ -945,6 +953,30 @@ function devicesHtml() {
   `;
 }
 
+function beginLibraryEdit(library) {
+  if (!library) return;
+  state.draft = {
+    id: library.id,
+    name: library.name,
+    base: library,
+    access: clone(library.access) || {
+      create: { mode: "all", users: [] },
+      edit: { mode: "all", users: [] },
+      erase: { mode: "all", users: [] },
+    },
+    fields: titleFields(library.fields).map((field) => ({
+      id: field.id,
+      name: field.name,
+      type: field.type,
+      title: !!field.title,
+      role: field.role || "",
+      viewer_edit: !!field.viewer_edit,
+      optionsText: (field.options || []).join(", "),
+    })),
+  };
+  go("edit-library");
+}
+
 function bindMain() {
   const q = document.getElementById("q");
   if (q) {
@@ -995,28 +1027,9 @@ function bindMain() {
   });
   byId("sample", addSample);
   byId("open-conflicts", () => go("conflicts"));
-  byId("edit-fields", () => {
-    const library = libraryById(state.libraryId);
-    state.draft = {
-      id: library.id,
-      name: library.name,
-      base: library,
-      access: clone(library.access) || {
-        create: { mode: "all", users: [] },
-        edit: { mode: "all", users: [] },
-        erase: { mode: "all", users: [] },
-      },
-      fields: titleFields(library.fields).map((field) => ({
-        id: field.id,
-        name: field.name,
-        type: field.type,
-        title: !!field.title,
-        role: field.role || "",
-        viewer_edit: !!field.viewer_edit,
-        optionsText: (field.options || []).join(", "),
-      })),
-    };
-    go("edit-library");
+  byId("edit-fields", () => beginLibraryEdit(libraryById(state.libraryId)));
+  document.querySelectorAll("[data-edit-library]").forEach((el) => {
+    el.onclick = () => beginLibraryEdit(libraryById(el.dataset.editLibrary));
   });
   byId("open-access", () => openAccess());
   byId("new-entry", () => {
@@ -1076,6 +1089,9 @@ function bindMain() {
     el.addEventListener("input", () => {
       state.draft.fields[Number(el.dataset.options)].optionsText = el.value;
     });
+  });
+  document.querySelectorAll("[data-move-field]").forEach((el) => {
+    el.onclick = () => moveField(Number(el.dataset.moveField), Number(el.dataset.move));
   });
   document.querySelectorAll("[data-remove-field]").forEach((el) => {
     el.onclick = () => {
@@ -1146,9 +1162,45 @@ function go(screen) {
   render();
 }
 
+function readFieldDraft() {
+  if (!state.draft?.fields) return;
+  document.querySelectorAll("[data-fname]").forEach((el) => {
+    const field = state.draft.fields[Number(el.dataset.fname)];
+    if (field) field.name = el.value;
+  });
+  document.querySelectorAll("[data-ftype]").forEach((el) => {
+    const field = state.draft.fields[Number(el.dataset.ftype)];
+    if (field && !field.title) field.type = el.value;
+  });
+  document.querySelectorAll("[data-options]").forEach((el) => {
+    const field = state.draft.fields[Number(el.dataset.options)];
+    if (field) field.optionsText = el.value;
+  });
+  document.querySelectorAll("[data-role]").forEach((el) => {
+    const field = state.draft.fields[Number(el.dataset.role)];
+    if (field) field.role = el.value;
+  });
+  document.querySelectorAll("[data-viewer-edit]").forEach((el) => {
+    const field = state.draft.fields[Number(el.dataset.viewerEdit)];
+    if (field) field.viewer_edit = el.checked;
+  });
+}
+
+function moveField(index, direction) {
+  readLibraryDraft();
+  readFieldDraft();
+  const next = index + direction;
+  const fields = state.draft.fields;
+  if (index <= 0 || next <= 0 || next >= fields.length) return;
+  const [item] = fields.splice(index, 1);
+  fields.splice(next, 0, item);
+  renderMain();
+}
+
 function readLibraryDraft() {
   const name = document.getElementById("lib-name");
   if (name) state.draft.name = name.value;
+  readFieldDraft();
   if (!state.draft.access) return;
   document.querySelectorAll("[data-access-mode]").forEach((el) => {
     state.draft.access[el.dataset.accessMode] = state.draft.access[el.dataset.accessMode] || { mode: "none", users: [] };
@@ -1471,7 +1523,7 @@ async function sync() {
     syncing = false;
     state.syncing = false;
     await loadState();
-    if (state.screen !== "entry" && state.screen !== "edit-library" && state.screen !== "people" && state.screen !== "access") render();
+    if (state.screen !== "entry" && state.screen !== "edit-library" && state.screen !== "people" && state.screen !== "account" && state.screen !== "access") render();
     else renderHeader();
     if (syncQueued) {
       syncQueued = false;
@@ -1900,23 +1952,30 @@ function peopleHtml() {
   const users = dir.users
     .map((user) => `
       <article class="card conflict">
-        <strong>${esc(user.name)}</strong>
+        <label class="field">Name<input data-name="${user.id}" value="${esc(user.name)}" /></label>
         <label class="field check"><input type="checkbox" data-admin="${user.id}" ${user.is_admin ? "checked" : ""} /> Admin</label>
         <label class="field">New password<input data-password="${user.id}" type="password" placeholder="Leave blank to keep" /></label>
-        <button class="btn ghost" data-save-user="${user.id}" type="button">Save user</button>
+        ${dir.groups.length ? `<span class="meta">Groups</span>${dir.groups.map((group) => `<label class="field check"><input data-user-group="${user.id}" value="${esc(group.id)}" type="checkbox" ${(user.group_ids || []).includes(group.id) ? "checked" : ""} /> ${esc(group.name)}</label>`).join("")}` : ""}
+        <div class="actions">
+          <button class="btn ghost" data-save-user="${user.id}" type="button">Save</button>
+          <button class="btn danger" data-remove-user="${user.id}" type="button">Remove</button>
+        </div>
       </article>`)
     .join("");
   const groups = dir.groups
     .map((group) => `
       <article class="card conflict">
-        <strong>${esc(group.name)}</strong>
+        <label class="field">Name<input data-group-name="${group.id}" value="${esc(group.name)}" /></label>
         ${dir.users
           .map(
             (user) =>
               `<label class="field check"><input type="checkbox" data-member="${group.id}" value="${user.id}" ${group.user_ids.includes(user.id) ? "checked" : ""} /> ${esc(user.name)}</label>`
           )
           .join("")}
-        <button class="btn ghost" data-save-group="${group.id}" type="button">Save members</button>
+        <div class="actions">
+          <button class="btn ghost" data-save-group="${group.id}" type="button">Save</button>
+          <button class="btn danger" data-remove-group="${group.id}" type="button">Remove</button>
+        </div>
       </article>`)
     .join("");
   const creatorBoxes = dir.users
@@ -1933,7 +1992,7 @@ function peopleHtml() {
     .join("");
   return `
     <div class="screen-head"><div><button class="back" id="back" type="button">Libraries</button><h2>People</h2></div></div>
-    <p class="lede">Admins can see and change everything. Everyone else only gets the access you set on each library.</p>
+    <p class="lede">Change a name, which groups a person belongs to, or who is in a group. Admins can see and change everything.</p>
     <h2>Add a user</h2>
     <div class="stack">
       <label class="field">Name<input id="new-user-name" /></label>
@@ -1963,6 +2022,19 @@ function peopleHtml() {
       </select></label>
       <label class="field">Every<input id="backup-every" type="number" min="1" value="${esc(state.backup?.every || 24)}" /></label>
       <button id="save-backup" class="btn primary" type="button">Save backup</button>
+    </div>
+  `;
+}
+
+function accountHtml() {
+  const user = state.session?.user || {};
+  return `
+    <div class="screen-head"><div><button class="back" id="back" type="button">Libraries</button><h2>Account</h2></div></div>
+    <p class="lede">Change the name you sign in with, or set a new password. Leave the password blank to keep the current one.</p>
+    <div class="stack">
+      <label class="field">Name<input id="account-name" value="${esc(user.name || "")}" /></label>
+      <label class="field">New password<input id="account-password" type="password" placeholder="Leave blank to keep" /></label>
+      <button id="save-account" class="btn primary" type="button">Save</button>
     </div>
   `;
 }
@@ -2046,11 +2118,18 @@ function bindAccessControls() {
   byId("save-creators", saveCreators);
   byId("save-backup", saveBackup);
   byId("save-access", saveAccess);
+  byId("save-account", saveAccount);
   document.querySelectorAll("[data-save-user]").forEach((button) => {
     button.onclick = () => saveUser(button.dataset.saveUser);
   });
+  document.querySelectorAll("[data-remove-user]").forEach((button) => {
+    button.onclick = () => removeUser(button.dataset.removeUser);
+  });
   document.querySelectorAll("[data-save-group]").forEach((button) => {
     button.onclick = () => saveGroup(button.dataset.saveGroup);
+  });
+  document.querySelectorAll("[data-remove-group]").forEach((button) => {
+    button.onclick = () => removeGroup(button.dataset.removeGroup);
   });
 }
 
@@ -2071,10 +2150,42 @@ async function addUser() {
 async function saveUser(id) {
   const password = document.querySelector(`[data-password="${id}"]`).value;
   const isAdmin = document.querySelector(`[data-admin="${id}"]`).checked;
+  const name = document.querySelector(`[data-name="${id}"]`).value;
+  const groupIds = [...document.querySelectorAll(`[data-user-group="${id}"]`)].filter((box) => box.checked).map((box) => box.value);
   try {
-    await api("/api/users/update", { id, password, is_admin: isAdmin });
+    await api("/api/users/update", { id, name, password, is_admin: isAdmin, group_ids: groupIds });
+    if (state.session?.user?.id === id) {
+      state.session.user.name = name.trim();
+      saveSession();
+    }
     notice("User saved");
     await openPeople();
+  } catch (error) {
+    if (error.message !== "signed out") notice(error.message, true);
+  }
+}
+
+async function removeUser(id) {
+  const name = document.querySelector(`[data-name="${id}"]`)?.value || "this user";
+  if (!window.confirm(`Remove ${name}? They will no longer be able to sign in.`)) return;
+  try {
+    await api("/api/users/remove", { id });
+    notice("User removed");
+    await openPeople();
+  } catch (error) {
+    if (error.message !== "signed out") notice(error.message, true);
+  }
+}
+
+async function saveAccount() {
+  const name = document.getElementById("account-name").value;
+  const password = document.getElementById("account-password").value;
+  try {
+    const data = await api("/api/account", { name, password });
+    state.session.user = data.user;
+    saveSession();
+    notice("Account saved");
+    renderHeader();
   } catch (error) {
     if (error.message !== "signed out") notice(error.message, true);
   }
@@ -2094,9 +2205,22 @@ async function saveGroup(groupId) {
   const userIds = [...document.querySelectorAll(`[data-member="${groupId}"]`)]
     .filter((box) => box.checked)
     .map((box) => box.value);
+  const name = document.querySelector(`[data-group-name="${groupId}"]`).value;
   try {
-    await api("/api/groups/members", { group_id: groupId, user_ids: userIds });
+    await api("/api/groups/members", { group_id: groupId, name, user_ids: userIds });
     notice("Group saved");
+    await openPeople();
+  } catch (error) {
+    if (error.message !== "signed out") notice(error.message, true);
+  }
+}
+
+async function removeGroup(groupId) {
+  const name = document.querySelector(`[data-group-name="${groupId}"]`)?.value || "this group";
+  if (!confirm(`Remove ${name}?`)) return;
+  try {
+    await api("/api/groups/remove", { group_id: groupId });
+    notice("Group removed");
     await openPeople();
   } catch (error) {
     if (error.message !== "signed out") notice(error.message, true);

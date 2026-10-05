@@ -218,6 +218,121 @@ def create_user(con: sqlite3.Connection, name: str, password: str, is_admin: boo
     return user_id
 
 
+def update_user(con: sqlite3.Connection, actor: dict, body: dict) -> dict:
+    if not actor or not actor.get("is_admin"):
+        raise AuthzError("Only an admin can do that")
+    row = con.execute("SELECT * FROM users WHERE id = ?", (body.get("id"),)).fetchone()
+    if row is None:
+        raise ValueError("User not found")
+    name = (body.get("name") if body.get("name") is not None else row["name"]).strip()
+    if not name:
+        raise ValueError("Name is required")
+    is_admin = bool(body.get("is_admin"))
+    if row["is_admin"] and not is_admin:
+        others = con.execute("SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND id != ?", (row["id"],)).fetchone()["n"]
+        if others == 0:
+            raise ValueError("Keep at least one admin")
+    password = body.get("password") or ""
+    try:
+        if password:
+            if len(password) < 4:
+                raise ValueError("Password must be at least 4 characters")
+            salt, digest = hash_password(password)
+            con.execute(
+                "UPDATE users SET name = ?, is_admin = ?, password_hash = ?, password_salt = ? WHERE id = ?",
+                (name, 1 if is_admin else 0, digest, salt, row["id"]),
+            )
+        else:
+            con.execute(
+                "UPDATE users SET name = ?, is_admin = ? WHERE id = ?",
+                (name, 1 if is_admin else 0, row["id"]),
+            )
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("That name is already used") from exc
+    if isinstance(body.get("group_ids"), list):
+        con.execute("DELETE FROM group_members WHERE user_id = ?", (row["id"],))
+        for group_id in body["group_ids"]:
+            if con.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone() is None:
+                raise ValueError("Group not found")
+            con.execute("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)", (group_id, row["id"]))
+    return {"ok": True, "name": name}
+
+
+def remove_user(con: sqlite3.Connection, actor: dict, user_id: str) -> dict:
+    if not actor or not actor.get("is_admin"):
+        raise AuthzError("Only an admin can do that")
+    if user_id == actor["id"]:
+        raise ValueError("You cannot remove the account you are using")
+    row = con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if row is None:
+        raise ValueError("User not found")
+    if row["is_admin"]:
+        others = con.execute("SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND id != ?", (user_id,)).fetchone()["n"]
+        if others == 0:
+            raise ValueError("Keep at least one admin")
+    con.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    con.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
+    con.execute("DELETE FROM grants WHERE subject_type = 'user' AND subject_id = ?", (user_id,))
+    con.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    return {"ok": True}
+
+
+def update_account(con: sqlite3.Connection, actor: dict, body: dict) -> dict:
+    if not actor:
+        raise PermissionError("Sign in first")
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise ValueError("Name is required")
+    password = body.get("password") or ""
+    try:
+        if password:
+            if len(password) < 4:
+                raise ValueError("Password must be at least 4 characters")
+            salt, digest = hash_password(password)
+            con.execute(
+                "UPDATE users SET name = ?, password_hash = ?, password_salt = ? WHERE id = ?",
+                (name, digest, salt, actor["id"]),
+            )
+        else:
+            con.execute("UPDATE users SET name = ? WHERE id = ?", (name, actor["id"]))
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("That name is already used") from exc
+    return {"id": actor["id"], "name": name, "is_admin": bool(actor.get("is_admin"))}
+
+
+def update_group(con: sqlite3.Connection, actor: dict, body: dict) -> dict:
+    if not actor or not actor.get("is_admin"):
+        raise AuthzError("Only an admin can do that")
+    group_id = body.get("group_id")
+    row = con.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+    if row is None:
+        raise ValueError("Group not found")
+    name = (body.get("name") if body.get("name") is not None else row["name"]).strip()
+    if not name:
+        raise ValueError("Name is required")
+    try:
+        con.execute("UPDATE groups SET name = ? WHERE id = ?", (name, group_id))
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("That name is already used") from exc
+    con.execute("DELETE FROM group_members WHERE group_id = ?", (group_id,))
+    for user_id in body.get("user_ids") or []:
+        if con.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone() is None:
+            raise ValueError("User not found")
+        con.execute("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)", (group_id, user_id))
+    return {"ok": True}
+
+
+def remove_group(con: sqlite3.Connection, actor: dict, group_id: str) -> dict:
+    if not actor or not actor.get("is_admin"):
+        raise AuthzError("Only an admin can do that")
+    if con.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone() is None:
+        raise ValueError("Group not found")
+    con.execute("DELETE FROM group_members WHERE group_id = ?", (group_id,))
+    con.execute("DELETE FROM grants WHERE subject_type = 'group' AND subject_id = ?", (group_id,))
+    con.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+    return {"ok": True}
+
+
 def _groups_for(con: sqlite3.Connection, user_id: str) -> list[str]:
     return [
         row["group_id"]
@@ -1131,8 +1246,11 @@ class Handler(BaseHTTPRequestHandler):
             "/api/logout": self._logout,
             "/api/users": self._add_user,
             "/api/users/update": self._update_user,
+            "/api/users/remove": self._remove_user,
+            "/api/account": self._account,
             "/api/groups": self._add_group,
             "/api/groups/members": self._set_members,
+            "/api/groups/remove": self._remove_group,
             "/api/grants": self._save_grants,
             "/api/creators": self._save_creators,
             "/api/sync": self._sync,
@@ -1204,26 +1322,14 @@ class Handler(BaseHTTPRequestHandler):
         return {"id": user_id}
 
     def _update_user(self, con, actor, body):
-        self._admin(actor)
-        row = con.execute("SELECT * FROM users WHERE id = ?", (body.get("id"),)).fetchone()
-        if row is None:
-            raise ValueError("User not found")
-        is_admin = bool(body.get("is_admin"))
-        if row["is_admin"] and not is_admin:
-            others = con.execute("SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND id != ?", (row["id"],)).fetchone()["n"]
-            if others == 0:
-                raise ValueError("Keep at least one admin")
-        if body.get("password"):
-            if len(body["password"]) < 4:
-                raise ValueError("Password must be at least 4 characters")
-            salt, digest = hash_password(body["password"])
-            con.execute(
-                "UPDATE users SET is_admin = ?, password_hash = ?, password_salt = ? WHERE id = ?",
-                (1 if is_admin else 0, digest, salt, row["id"]),
-            )
-        else:
-            con.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if is_admin else 0, row["id"]))
-        return {"ok": True}
+        return update_user(con, actor, body)
+
+    def _remove_user(self, con, actor, body):
+        return remove_user(con, actor, body.get("id") or "")
+
+    def _account(self, con, actor, body):
+        user = update_account(con, actor, body)
+        return {"user": user}
 
     def _add_group(self, con, actor, body):
         self._admin(actor)
@@ -1238,16 +1344,10 @@ class Handler(BaseHTTPRequestHandler):
         return {"id": group_id}
 
     def _set_members(self, con, actor, body):
-        self._admin(actor)
-        group_id = body.get("group_id")
-        if con.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone() is None:
-            raise ValueError("Group not found")
-        con.execute("DELETE FROM group_members WHERE group_id = ?", (group_id,))
-        for user_id in body.get("user_ids") or []:
-            if con.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone() is None:
-                raise ValueError("User not found")
-            con.execute("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)", (group_id, user_id))
-        return {"ok": True}
+        return update_group(con, actor, body)
+
+    def _remove_group(self, con, actor, body):
+        return remove_group(con, actor, body.get("group_id") or "")
 
     def _save_grants(self, con, actor, body):
         self._admin(actor)
