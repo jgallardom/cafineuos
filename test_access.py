@@ -357,6 +357,64 @@ class AccessTests(unittest.TestCase):
         self.assertEqual(values["notes"]["v"], "Keep")
         self.assertEqual(values["title"]["v"], "Gate")
 
+    def test_creator_keeps_people_fields_when_a_later_save_clears_them(self):
+        self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "tasks",
+                "name": "Tasks",
+                "fields": [
+                    {"id": "title", "name": "Title", "type": "text"},
+                    {"id": "encargado", "name": "Encargado", "type": "users", "role": "viewers"},
+                    {"id": "creado", "name": "Creado por", "type": "users"},
+                    {"id": "done", "name": "Done", "type": "boolean", "viewer_edit": True},
+                ],
+                "access": {
+                    "create": {"mode": "list", "users": [self.ana["id"]]},
+                    "edit": {"mode": "none", "users": []},
+                    "erase": {"mode": "none", "users": []},
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+        })
+        made = self.sync(self.ana, {
+            "cursor": 0,
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {
+                    "title": cell("Gate"),
+                    "encargado": cell([self.bo["id"]]),
+                    "creado": cell([self.ana["id"]]),
+                    "done": cell(False),
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:02:00Z",
+            }],
+        })
+        self.assertTrue(made["accepted"])
+        cleared = self.sync(self.ana, {
+            "cursor": made["cursor"],
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {
+                    "title": cell("Gate"),
+                    "encargado": cell([]),
+                    "creado": cell([]),
+                    "done": cell(True),
+                },
+                "base_rev": made["accepted"][0]["rev"],
+                "updated_at": "2026-09-28T00:03:00Z",
+            }],
+        })
+        self.assertTrue(cleared["accepted"])
+        values = json.loads(self.con.execute("SELECT values_json FROM entries WHERE id = 'task1'").fetchone()["values_json"])
+        self.assertEqual(values["encargado"]["v"], [self.bo["id"]])
+        self.assertEqual(values["creado"]["v"], [self.ana["id"]])
+        self.assertTrue(values["done"]["v"])
+
     def test_viewer_added_later_still_receives_the_library(self):
         self.sync(self.admin, {
             "cursor": 0,

@@ -230,6 +230,11 @@ function canEditField(library, entry, field) {
   return false;
 }
 
+function fieldIsEditable(library, entry, field) {
+  if (entry?.isNew) return canCreateEntry(library);
+  return canEditField(library, entry, field);
+}
+
 function canCreateEntry(library) {
   if (state.access?.is_admin) return true;
   if (can(library.id, "entry", "create")) return true;
@@ -436,9 +441,15 @@ function conflictRows() {
 }
 
 function selectedList(value) {
-  if (Array.isArray(value)) return value.map(String);
-  if (value === null || value === undefined || value === "") return [];
-  return [String(value)];
+  const list = Array.isArray(value) ? value : value === null || value === undefined || value === "" ? [] : [value];
+  return list.map((item) => {
+    if (item && typeof item === "object") return String(item.id || item.name || "");
+    return String(item);
+  }).filter((item) => item !== "");
+}
+
+function isSelected(selected, id, name) {
+  return selected.includes(id) || (!!name && selected.includes(name));
 }
 
 function dateInputValue(value) {
@@ -822,20 +833,20 @@ function entryHtml() {
   const fields = titleFields(library.fields)
     .filter((field) => draft.isNew ? true : canSeeEntry(library, draft))
     .map((field) => {
-      const editable = draft.isNew ? canCreateEntry(library) : canEditField(library, draft, field);
+      const editable = fieldIsEditable(library, draft, field);
       const value = draft.values?.[field.id]?.v ?? "";
       const locked = editable ? "" : "disabled";
       if (field.type === "users") {
         const selected = selectedList(value);
         const people = state.access?.people || [];
         const boxes = people.length
-          ? people.map((person) => `<label class="field check"><input data-users="${field.id}" value="${esc(person.id)}" type="checkbox" ${selected.includes(person.id) ? "checked" : ""} ${locked} /> ${esc(person.name)}</label>`).join("")
+          ? people.map((person) => `<label class="field check"><input data-users="${field.id}" value="${esc(person.id)}" type="checkbox" ${isSelected(selected, person.id, person.name) ? "checked" : ""} ${locked} /> ${esc(person.name)}</label>`).join("")
           : `<p class="lede">Sync while online once so names are available offline.</p>`;
         return `<div class="field"><span>${esc(field.name)}</span>${boxes}</div>`;
       }
       if (field.type === "multi") {
         const selected = selectedList(value);
-        const boxes = (field.options || []).map((option) => `<label class="field check"><input data-multi="${field.id}" value="${esc(option)}" type="checkbox" ${selected.includes(option) ? "checked" : ""} ${locked} /> ${esc(option)}</label>`).join("");
+        const boxes = (field.options || []).map((option) => `<label class="field check"><input data-multi="${field.id}" value="${esc(option)}" type="checkbox" ${isSelected(selected, option) ? "checked" : ""} ${locked} /> ${esc(option)}</label>`).join("");
         return `<div class="field"><span>${esc(field.name)}</span>${boxes}</div>`;
       }
       if (field.type === "image" || field.type === "file") {
@@ -1130,6 +1141,14 @@ function bindMain() {
       state.draft.values[el.dataset.field] = { v: value === "" ? null : value, t: now() };
     });
   });
+  document.querySelectorAll("[data-users], [data-multi]").forEach((el) => {
+    el.addEventListener("change", () => {
+      if (!state.draft) return;
+      const fieldId = el.dataset.users || el.dataset.multi;
+      state.draft.values = state.draft.values || {};
+      state.draft.values[fieldId] = { v: checkedChoice(fieldId, state.draft.values[fieldId]?.v), t: now() };
+    });
+  });
   document.querySelectorAll("[data-use-device]").forEach((el) => {
     el.onclick = () => switchDevice(el.dataset.useDevice);
   });
@@ -1328,6 +1347,7 @@ async function openEntry(id) {
 
 async function saveEntry(deleted, options = {}) {
   const draft = state.draft;
+  const fromForm = readEntryFromDom({ ...(draft.values || {}) });
   const existing = await getOne("entries", draft.id);
   const record = existing || {
     id: draft.id,
@@ -1350,7 +1370,7 @@ async function saveEntry(deleted, options = {}) {
     go("library");
     return;
   }
-  const typed = readEntryFromDom({ ...(record.values || {}), ...(draft.values || {}) });
+  const typed = { ...(record.values || {}), ...fromForm };
   const empty = !Object.values(typed).some((cell) => cellValue(cell) !== null);
   if (!deleted && options.skipIfUnchanged && existing && !entryChanged(existing.values, typed)) {
     go("library");
@@ -1387,22 +1407,30 @@ function entryChanged(before, after) {
   return false;
 }
 
+function choiceBoxes(fieldId) {
+  return [...document.querySelectorAll("[data-users], [data-multi]")].filter((box) => (box.dataset.users || box.dataset.multi) === fieldId);
+}
+
+function checkedChoice(fieldId, previousValue) {
+  const boxes = choiceBoxes(fieldId);
+  const shown = new Set(boxes.map((box) => box.value));
+  const labels = new Set(boxes.map((box) => (box.parentElement?.textContent || "").trim()));
+  const checked = boxes.filter((box) => box.checked).map((box) => box.value);
+  const kept = selectedList(previousValue).filter((id) => !shown.has(id) && !labels.has(id));
+  kept.forEach((id) => {
+    if (!checked.includes(id)) checked.push(id);
+  });
+  return checked;
+}
+
 function readEntryFromDom(fallback) {
   const values = clone(fallback) || {};
-  const library = libraryById(state.libraryId);
-  const editable = (fieldId) => {
-    const field = (library?.fields || []).find((item) => item.id === fieldId);
-    if (!field) return true;
-    return canEditField(library, state.draft, field);
-  };
-  const grouped = new Map();
+  const seen = new Set();
   document.querySelectorAll("[data-users], [data-multi]").forEach((el) => {
-    if (el.disabled || !editable(el.dataset.users || el.dataset.multi)) return;
     const fieldId = el.dataset.users || el.dataset.multi;
-    if (!grouped.has(fieldId)) grouped.set(fieldId, []);
-    if (el.checked) grouped.get(fieldId).push(el.value);
-  });
-  grouped.forEach((ids, fieldId) => {
+    if (seen.has(fieldId) || el.disabled) return;
+    seen.add(fieldId);
+    const ids = checkedChoice(fieldId, cellValue(values[fieldId]));
     const previous = values[fieldId];
     if (!sameVal(previous, { v: ids })) values[fieldId] = { v: ids, t: now() };
   });
@@ -1410,7 +1438,7 @@ function readEntryFromDom(fallback) {
     const value = el.type === "checkbox" ? el.checked : el.value;
     const normalized = value === "" ? null : el.type === "number" && value !== "" ? Number(value) : value;
     const previous = values[el.dataset.field];
-    if (el.disabled || !editable(el.dataset.field)) return;
+    if (el.disabled) return;
     if (el.type === "checkbox" && normalized === false && cellValue(previous) === null) return;
     if (!sameVal(previous, { v: normalized })) {
       values[el.dataset.field] = { v: normalized, t: now() };
