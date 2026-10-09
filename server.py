@@ -821,11 +821,43 @@ def _upsert_library(con, item, device_id, device_name, actor=None, grants=None):
     return "accepted", rev
 
 
+def _file_items(value):
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict) and item.get("id")]
+    if isinstance(value, dict) and value.get("id"):
+        return [value]
+    return []
+
+
+def _merge_saved_files(library, current, incoming):
+    if not isinstance(incoming, dict):
+        return incoming
+    fields = {field.get("id"): field for field in (library or {}).get("fields") or []}
+    current = current or {}
+    merged = dict(incoming)
+    for field_id, cell in incoming.items():
+        field = fields.get(field_id)
+        if not field or field.get("type") not in ("file", "image"):
+            continue
+        raw = _cell_value(cell)
+        if isinstance(raw, list):
+            continue
+        previous_items = _file_items(_cell_value(current.get(field_id)))
+        new_items = _file_items(raw)
+        if not previous_items or not new_items:
+            continue
+        seen = {item.get("id") for item in previous_items}
+        extra = [item for item in new_items if item.get("id") not in seen]
+        stamp = cell.get("t") if isinstance(cell, dict) else None
+        merged[field_id] = {"v": previous_items + extra, "t": stamp}
+    return merged
+
+
 def _merge_entry_values(row, item, actor, grants, library=None):
     current = json.loads(row["values_json"]) if row is not None else {}
     incoming = item.get("values") or {}
     if actor is None or actor.get("is_admin") or row is None:
-        return incoming, None
+        return _merge_saved_files(library, current, incoming), None
     merged = dict(current)
     created_by = row["created_by"]
     blocked = False
@@ -854,7 +886,7 @@ def _merge_entry_values(row, item, actor, grants, library=None):
             changed = True
     if blocked and not changed:
         return None, "You cannot edit that field"
-    return merged, None
+    return _merge_saved_files(library, current, merged), None
 
 
 def _upsert_entry(con, item, device_id, device_name, actor=None, grants=None):

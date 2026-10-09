@@ -562,6 +562,47 @@ class AccessTests(unittest.TestCase):
         self.assertIsNone(self.con.execute("SELECT 1 FROM groups WHERE id = 'g-bo'").fetchone())
 
 
+    def test_a_new_file_is_added_beside_the_file_already_there(self):
+        made = self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "tasks",
+                "name": "Tasks",
+                "fields": [
+                    {"id": "title", "name": "Title", "type": "text"},
+                    {"id": "archivo", "name": "Archivo", "type": "file"},
+                ],
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {
+                    "title": cell("Gate"),
+                    "archivo": cell({"id": "file-a", "name": "one.pdf"}),
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:02:00Z",
+            }],
+        })
+        rev = next(item["rev"] for item in made["accepted"] if item["id"] == "task1")
+        self.sync(self.admin, {
+            "cursor": made["cursor"],
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {
+                    "title": cell("Gate"),
+                    "archivo": cell({"id": "file-b", "name": "two.pdf"}),
+                },
+                "base_rev": rev,
+                "updated_at": "2026-09-28T00:03:00Z",
+            }],
+        })
+        values = json.loads(self.con.execute("SELECT values_json FROM entries WHERE id = 'task1'").fetchone()["values_json"])
+        self.assertEqual([item["id"] for item in values["archivo"]["v"]], ["file-a", "file-b"])
+
     def test_viewer_can_download_a_file_on_an_entry_they_can_see(self):
         self.sync(self.admin, {
             "cursor": 0,

@@ -1,5 +1,5 @@
-const CACHE = "cafineuos-shell-8";
-const FILES = ["/", "/static/app.js", "/static/styles.css", "/static/manifest.webmanifest"];
+const CACHE = "cafineuos-shell-9";
+const FILES = ["/", "/static/app.js?v=9", "/static/styles.css?v=9", "/static/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(FILES)));
