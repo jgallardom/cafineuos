@@ -562,5 +562,47 @@ class AccessTests(unittest.TestCase):
         self.assertIsNone(self.con.execute("SELECT 1 FROM groups WHERE id = 'g-bo'").fetchone())
 
 
+    def test_viewer_can_download_a_file_on_an_entry_they_can_see(self):
+        self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "tasks",
+                "name": "Tasks",
+                "fields": [
+                    {"id": "title", "name": "Title", "type": "text"},
+                    {"id": "see", "name": "Encargado", "type": "users", "role": "viewers"},
+                    {"id": "photo", "name": "Photo", "type": "image"},
+                ],
+                "access": {
+                    "create": {"mode": "none", "users": []},
+                    "edit": {"mode": "none", "users": []},
+                    "erase": {"mode": "none", "users": []},
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {
+                    "title": cell("Gate"),
+                    "see": cell([self.ana["id"]]),
+                    "photo": cell({"id": "blob1", "name": "gate.jpg"}),
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:02:00Z",
+            }],
+        })
+        self.con.execute(
+            "INSERT INTO blobs (id, entry_id, field_id, name, mime, size, created_by, created_at) VALUES ('blob1', 'task1', 'photo', 'gate.jpg', 'image/jpeg', 4, ?, 't')",
+            (self.admin["id"],),
+        )
+        self.con.commit()
+        row = self.con.execute("SELECT * FROM blobs WHERE id = 'blob1'").fetchone()
+        self.assertTrue(server._blob_visible(self.con, self.ana, row))
+        outsider = self.person("Cia", "cia-pass", False)
+        self.assertFalse(server._blob_visible(self.con, outsider, row))
+
+
 if __name__ == "__main__":
     unittest.main()

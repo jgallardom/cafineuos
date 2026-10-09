@@ -1194,7 +1194,11 @@ def _blob_visible(con, actor, row) -> bool:
     if entry is None:
         return False
     library = _library_by_id(con, entry["library_id"])
-    return _entry_allowed(actor, load_grants(con), library, "see", entry["created_by"], json.loads(entry["values_json"]))
+    grants = load_grants(con)
+    values = json.loads(entry["values_json"])
+    if not _entry_allowed(actor, grants, library, "see", entry["created_by"], values):
+        return False
+    return not _field_hidden(actor, grants, entry["library_id"], row["field_id"] or "")
 
 
 class Handler(BaseHTTPRequestHandler):

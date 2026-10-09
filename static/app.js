@@ -825,6 +825,38 @@ function accessBlock(draft) {
   }).join("");
 }
 
+function readOnlyText(field, value) {
+  if (field.type === "boolean") {
+    const on = value === true || value === 1 || value === "1" || value === "true" || value === "yes" || value === "Yes";
+    return on ? "Yes" : "No";
+  }
+  if (field.type === "users") {
+    const people = state.access?.people || [];
+    return selectedList(value).map((id) => people.find((person) => person.id === id || person.name === id)?.name || id).join(", ");
+  }
+  if (field.type === "multi" || Array.isArray(value)) return selectedList(value).join(", ");
+  if (value === null || value === undefined || value === "") return "";
+  return String(value);
+}
+
+function readOnlyHtml(field, value) {
+  const text = readOnlyText(field, value);
+  return `<div class="field"><span>${esc(field.name)}</span><p class="readonly">${text ? esc(text) : "Empty"}</p></div>`;
+}
+
+function fileFieldHtml(field, value, editable) {
+  const meta = value && typeof value === "object" ? value : null;
+  const preview = meta && state.previews?.[meta.id] && field.type === "image" ? `<img class="preview" alt="" src="${esc(state.previews[meta.id])}" />` : "";
+  const label = meta?.name ? esc(meta.name) : "No file yet";
+  const download = meta?.id
+    ? `<button class="btn ghost" type="button" data-download="${esc(meta.id)}" data-download-name="${esc(meta.name || "file")}">Download</button>`
+    : "";
+  const picker = editable
+    ? `<input data-file="${field.id}" data-kind="${field.type}" type="file" ${field.type === "image" ? 'accept="image/*"' : ""} />`
+    : "";
+  return `<div class="field"><span>${esc(field.name)}</span>${preview}<span>${label}</span>${download}${picker}</div>`;
+}
+
 function entryHtml() {
   const library = libraryById(state.libraryId);
   const draft = state.draft;
@@ -836,6 +868,7 @@ function entryHtml() {
       const editable = fieldIsEditable(library, draft, field);
       const value = draft.values?.[field.id]?.v ?? "";
       const locked = editable ? "" : "disabled";
+      if (!editable && field.type !== "image" && field.type !== "file") return readOnlyHtml(field, value);
       if (field.type === "users") {
         const selected = selectedList(value);
         const people = state.access?.people || [];
@@ -849,12 +882,7 @@ function entryHtml() {
         const boxes = (field.options || []).map((option) => `<label class="field check"><input data-multi="${field.id}" value="${esc(option)}" type="checkbox" ${isSelected(selected, option) ? "checked" : ""} ${locked} /> ${esc(option)}</label>`).join("");
         return `<div class="field"><span>${esc(field.name)}</span>${boxes}</div>`;
       }
-      if (field.type === "image" || field.type === "file") {
-        const meta = value && typeof value === "object" ? value : null;
-        const preview = meta && state.previews?.[meta.id] && field.type === "image" ? `<img class="preview" alt="" src="${esc(state.previews[meta.id])}" />` : "";
-        const label = meta?.name ? esc(meta.name) : "No file yet";
-        return `<label class="field">${esc(field.name)}${preview}<span>${label}</span><input data-file="${field.id}" data-kind="${field.type}" type="file" ${field.type === "image" ? 'accept="image/*"' : ""} ${locked} /></label>`;
-      }
+      if (field.type === "image" || field.type === "file") return fileFieldHtml(field, value, editable);
       if (field.type === "longtext") {
         return `<label class="field">${esc(field.name)}<textarea data-field="${field.id}" ${locked}>${esc(value)}</textarea></label>`;
       }
@@ -1186,6 +1214,9 @@ function bindMain() {
   });
   document.querySelectorAll("[data-file]").forEach((el) => {
     el.addEventListener("change", () => rememberFile(el));
+  });
+  document.querySelectorAll("[data-download]").forEach((el) => {
+    el.onclick = () => downloadBlob({ id: el.dataset.download, name: el.dataset.downloadName || "file" });
   });
   bindAccessControls();
 }
@@ -1624,6 +1655,35 @@ async function uploadBlobs() {
     row.dirty = false;
     await putOne("blobs", row);
   }
+}
+
+async function downloadBlob(meta) {
+  if (!meta?.id) return;
+  let row = await getOne("blobs", meta.id);
+  if (!row?.blob) {
+    if (!isOnline()) {
+      notice("That file is not on this device yet. Sync while online.", true);
+      return;
+    }
+    const response = await fetch("/api/blobs/" + encodeURIComponent(meta.id), {
+      headers: { Authorization: "Bearer " + (state.session?.token || "") },
+    });
+    if (!response.ok) {
+      notice("Could not download that file.", true);
+      return;
+    }
+    const blob = await response.blob();
+    row = { id: meta.id, name: meta.name || "file", mime: blob.type || "application/octet-stream", blob, dirty: false };
+    await putOne("blobs", row);
+  }
+  const url = URL.createObjectURL(row.blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = row.name || meta.name || "file";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
 
 async function downloadMissingBlobs() {

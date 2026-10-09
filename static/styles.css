@@ -361,3 +361,12 @@ img.preview {
   border-radius: 10px;
   margin-top: 8px;
 }
+
+.readonly {
+  margin: 0;
+  color: var(--ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
