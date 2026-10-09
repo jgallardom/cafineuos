@@ -362,6 +362,16 @@ img.preview {
   margin-top: 8px;
 }
 
+.file-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.file-row .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
 .readonly {
   margin: 0;
   color: var(--ink);

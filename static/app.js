@@ -667,9 +667,19 @@ function groupLabel(field, entry) {
     const ids = Array.isArray(value) ? value.map(String) : [String(value)];
     return ids.map((id) => (state.access?.people || []).find((person) => person.id === id)?.name || id).join(", ");
   }
+  if (field.type === "image" || field.type === "file") {
+    const names = fileList(value).map((item) => item.name || "File");
+    return names.length ? names.join(", ") : "Empty";
+  }
   if (Array.isArray(value)) return value.map(String).join(", ");
   if (value && typeof value === "object") return value.name || "File";
   return String(value);
+}
+
+function fileList(value) {
+  if (Array.isArray(value)) return value.filter((item) => item && typeof item === "object" && item.id);
+  if (value && typeof value === "object" && value.id) return [value];
+  return [];
 }
 
 function entryRowHtml(library, entry) {
@@ -845,16 +855,17 @@ function readOnlyHtml(field, value) {
 }
 
 function fileFieldHtml(field, value, editable) {
-  const meta = value && typeof value === "object" ? value : null;
-  const preview = meta && state.previews?.[meta.id] && field.type === "image" ? `<img class="preview" alt="" src="${esc(state.previews[meta.id])}" />` : "";
-  const label = meta?.name ? esc(meta.name) : "No file yet";
-  const download = meta?.id
-    ? `<button class="btn ghost" type="button" data-download="${esc(meta.id)}" data-download-name="${esc(meta.name || "file")}">Download</button>`
-    : "";
+  const files = fileList(value);
+  const rows = files.map((meta) => {
+    const preview = state.previews?.[meta.id] && field.type === "image" ? `<img class="preview" alt="" src="${esc(state.previews[meta.id])}" />` : "";
+    const remove = editable ? `<button class="btn ghost" type="button" data-remove-file="${esc(field.id)}" data-blob="${esc(meta.id)}">Remove</button>` : "";
+    return `<div class="file-row">${preview}<span>${esc(meta.name || "File")}</span><div class="actions"><button class="btn ghost" type="button" data-download="${esc(meta.id)}" data-download-name="${esc(meta.name || "file")}">Download</button>${remove}</div></div>`;
+  }).join("");
+  const empty = files.length ? "" : `<span>No file yet</span>`;
   const picker = editable
-    ? `<input data-file="${field.id}" data-kind="${field.type}" type="file" ${field.type === "image" ? 'accept="image/*"' : ""} />`
+    ? `<input data-file="${field.id}" data-kind="${field.type}" type="file" multiple ${field.type === "image" ? 'accept="image/*"' : ""} />`
     : "";
-  return `<div class="field"><span>${esc(field.name)}</span>${preview}<span>${label}</span>${download}${picker}</div>`;
+  return `<div class="field"><span>${esc(field.name)}</span>${empty}${rows}${picker}</div>`;
 }
 
 function entryHtml() {
@@ -1218,6 +1229,9 @@ function bindMain() {
   document.querySelectorAll("[data-download]").forEach((el) => {
     el.onclick = () => downloadBlob({ id: el.dataset.download, name: el.dataset.downloadName || "file" });
   });
+  document.querySelectorAll("[data-remove-file]").forEach((el) => {
+    el.onclick = () => removeFile(el.dataset.removeFile, el.dataset.blob);
+  });
   bindAccessControls();
 }
 
@@ -1368,10 +1382,10 @@ async function openEntry(id) {
   const library = libraryById(entry.library_id);
   for (const field of library?.fields || []) {
     if (field.type !== "image" && field.type !== "file") continue;
-    const meta = state.draft.values?.[field.id]?.v;
-    if (!meta?.id) continue;
-    const row = await getOne("blobs", meta.id);
-    if (row?.blob) state.previews[meta.id] = URL.createObjectURL(row.blob);
+    for (const meta of fileList(state.draft.values?.[field.id]?.v)) {
+      const row = await getOne("blobs", meta.id);
+      if (row?.blob) state.previews[meta.id] = URL.createObjectURL(row.blob);
+    }
   }
   go("entry");
 }
@@ -1619,21 +1633,35 @@ async function sync() {
 }
 
 async function rememberFile(input) {
-  const file = input.files && input.files[0];
-  if (!file || !state.draft) return;
-  const id = uuid();
-  await putOne("blobs", {
-    id,
-    name: file.name,
-    mime: file.type || "application/octet-stream",
-    blob: file,
-    dirty: true,
-    entry_id: state.draft.id,
-    field_id: input.dataset.file,
-  });
-  state.previews[id] = URL.createObjectURL(file);
+  const files = [...(input.files || [])];
+  if (!files.length || !state.draft) return;
+  const fieldId = input.dataset.file;
   state.draft.values = state.draft.values || {};
-  state.draft.values[input.dataset.file] = { v: { id, name: file.name, mime: file.type, size: file.size }, t: now() };
+  const kept = fileList(state.draft.values[fieldId]?.v);
+  const added = [];
+  for (const file of files) {
+    const id = uuid();
+    await putOne("blobs", {
+      id,
+      name: file.name,
+      mime: file.type || "application/octet-stream",
+      blob: file,
+      dirty: true,
+      entry_id: state.draft.id,
+      field_id: fieldId,
+    });
+    state.previews[id] = URL.createObjectURL(file);
+    added.push({ id, name: file.name, mime: file.type, size: file.size });
+  }
+  state.draft.values[fieldId] = { v: kept.concat(added), t: now() };
+  renderMain();
+}
+
+function removeFile(fieldId, blobId) {
+  if (!state.draft || !fieldId || !blobId) return;
+  state.draft.values = state.draft.values || {};
+  const kept = fileList(state.draft.values[fieldId]?.v).filter((item) => item.id !== blobId);
+  state.draft.values[fieldId] = { v: kept, t: now() };
   renderMain();
 }
 
@@ -1692,8 +1720,7 @@ async function downloadMissingBlobs() {
     const library = libraryById(entry.library_id);
     for (const field of library?.fields || []) {
       if (field.type !== "image" && field.type !== "file") continue;
-      const meta = entry.values?.[field.id]?.v;
-      if (meta?.id) wanted.push(meta);
+      wanted.push(...fileList(entry.values?.[field.id]?.v));
     }
   }
   for (const meta of wanted) {

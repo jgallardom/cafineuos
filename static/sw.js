@@ -1,4 +1,4 @@
-const CACHE = "cafineuos-shell-7";
+const CACHE = "cafineuos-shell-8";
 const FILES = ["/", "/static/app.js", "/static/styles.css", "/static/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
