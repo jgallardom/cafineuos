@@ -191,27 +191,18 @@ class AccessTests(unittest.TestCase):
                 "updated_at": "2026-09-28T00:02:00Z",
             }],
         })
-        self.assertEqual(edited["forbidden"][0]["error"], "You cannot edit that field")
-        site = self.sync(self.ana, {
-            "cursor": pulled["cursor"],
-            "entries": [{
-                "id": "e1",
-                "library_id": "lib1",
-                "values": {"f1": cell("Pier north")},
-                "base_rev": 1,
-                "updated_at": "2026-09-28T00:03:00Z",
-            }],
-        })
-        self.assertEqual(site["accepted"][0]["rev"], 2)
+        self.assertTrue(edited["accepted"])
+        self.assertEqual(edited["forbidden"], [])
         stored = self.con.execute("SELECT values_json FROM entries WHERE id = 'e1'").fetchone()[0]
         self.assertIn("secret", stored)
+        self.assertIn("Pier north", stored)
         erased = self.sync(self.ana, {
-            "cursor": site["cursor"],
+            "cursor": edited["cursor"],
             "entries": [{
                 "id": "e1",
                 "library_id": "lib1",
                 "values": {"f1": cell("Pier north")},
-                "base_rev": 2,
+                "base_rev": edited["accepted"][0]["rev"],
                 "deleted": True,
                 "updated_at": "2026-09-28T00:04:00Z",
             }],
@@ -307,6 +298,64 @@ class AccessTests(unittest.TestCase):
             }],
         })
         self.assertTrue(edited["accepted"])
+
+    def test_viewer_can_save_an_open_field_when_another_field_is_locked(self):
+        self.sync(self.admin, {
+            "cursor": 0,
+            "libraries": [{
+                "id": "tasks",
+                "name": "Tasks",
+                "fields": [
+                    {"id": "title", "name": "Title", "type": "text"},
+                    {"id": "see", "name": "Who can see", "type": "users", "role": "viewers"},
+                    {"id": "done", "name": "Done", "type": "boolean", "viewer_edit": True},
+                    {"id": "notes", "name": "Notes", "type": "text"},
+                ],
+                "access": {
+                    "create": {"mode": "none", "users": []},
+                    "edit": {"mode": "none", "users": []},
+                    "erase": {"mode": "none", "users": []},
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:00:00Z",
+            }],
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {
+                    "title": cell("Gate"),
+                    "see": cell([self.bo["id"]]),
+                    "done": cell(False),
+                    "notes": cell("Keep"),
+                },
+                "base_rev": 0,
+                "updated_at": "2026-09-28T00:02:00Z",
+            }],
+        })
+        seen = self.sync(self.bo, {"cursor": 0})
+        rev = next(item["rev"] for item in seen["changes"] if item["id"] == "task1")
+        saved = self.sync(self.bo, {
+            "cursor": seen["cursor"],
+            "entries": [{
+                "id": "task1",
+                "library_id": "tasks",
+                "values": {
+                    "title": cell("Changed title"),
+                    "see": cell([self.bo["id"]]),
+                    "done": cell(True),
+                    "notes": cell("Changed notes"),
+                },
+                "base_rev": rev,
+                "updated_at": "2026-09-28T00:03:00Z",
+            }],
+        })
+        self.assertTrue(saved["accepted"])
+        self.assertEqual(saved["forbidden"], [])
+        row = self.con.execute("SELECT values_json FROM entries WHERE id = 'task1'").fetchone()
+        values = json.loads(row["values_json"])
+        self.assertTrue(values["done"]["v"])
+        self.assertEqual(values["notes"]["v"], "Keep")
+        self.assertEqual(values["title"]["v"], "Gate")
 
     def test_viewer_added_later_still_receives_the_library(self):
         self.sync(self.admin, {

@@ -828,6 +828,8 @@ def _merge_entry_values(row, item, actor, grants, library=None):
         return incoming, None
     merged = dict(current)
     created_by = row["created_by"]
+    blocked = False
+    changed = False
     for field_id, cell in incoming.items():
         previous = current.get(field_id)
         if _same_cell(previous, cell):
@@ -835,14 +837,23 @@ def _merge_entry_values(row, item, actor, grants, library=None):
             continue
         field = _field_by_id(library, field_id)
         if not _entry_allowed(actor, grants, library, "edit", created_by, current, field):
-            return None, "You cannot edit that field"
+            blocked = True
+            if previous is not None:
+                merged[field_id] = previous
+            else:
+                merged.pop(field_id, None)
+            continue
         merged[field_id] = cell
+        changed = True
     for field_id in list(merged):
         if field_id in incoming:
             continue
         field = _field_by_id(library, field_id)
         if _entry_allowed(actor, grants, library, "edit", created_by, current, field):
             del merged[field_id]
+            changed = True
+    if blocked and not changed:
+        return None, "You cannot edit that field"
     return merged, None
 
 

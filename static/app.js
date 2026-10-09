@@ -409,7 +409,6 @@ function titleFields(fields) {
   delete title.role;
   delete title.options;
   delete title.optionsText;
-  delete title.viewer_edit;
   return [title, ...list.filter((field) => !field.title)];
 }
 
@@ -434,6 +433,22 @@ function conflictRows() {
     ...state.libraries.filter((row) => row.conflict && !row.deleted).map((row) => ({ kind: "library", row })),
     ...state.entries.filter((row) => row.conflict).map((row) => ({ kind: "entry", row })),
   ];
+}
+
+function selectedList(value) {
+  if (Array.isArray(value)) return value.map(String);
+  if (value === null || value === undefined || value === "") return [];
+  return [String(value)];
+}
+
+function dateInputValue(value) {
+  const match = String(value ?? "").match(/^(\d{4}-\d{2}-\d{2})/);
+  return match ? match[1] : "";
+}
+
+function timeInputValue(value) {
+  const match = String(value ?? "").match(/^(\d{2}:\d{2})/);
+  return match ? match[1] : "";
 }
 
 function cellValue(cell) {
@@ -729,8 +744,9 @@ function libraryFormHtml() {
           <p class="lede">Entry title. Text, always first.</p>
         </div>`;
       }
+      const optionsText = field.optionsText != null ? field.optionsText : (field.options || []).join(", ");
       const options = field.type === "choice" || field.type === "multi"
-        ? `<input data-options="${index}" placeholder="Options, comma separated" value="${esc(field.optionsText || "")}" />`
+        ? `<input data-options="${index}" placeholder="Options, comma separated" value="${esc(optionsText)}" />`
         : "";
       const role = field.type === "users"
         ? `<select data-role="${index}"><option value="" ${field.role ? "" : "selected"}>People list</option><option value="viewers" ${field.role === "viewers" ? "selected" : ""}>Who can see the entry</option><option value="editors" ${field.role === "editors" ? "selected" : ""}>Who can modify the entry</option></select>`
@@ -810,7 +826,7 @@ function entryHtml() {
       const value = draft.values?.[field.id]?.v ?? "";
       const locked = editable ? "" : "disabled";
       if (field.type === "users") {
-        const selected = Array.isArray(value) ? value.map(String) : [];
+        const selected = selectedList(value);
         const people = state.access?.people || [];
         const boxes = people.length
           ? people.map((person) => `<label class="field check"><input data-users="${field.id}" value="${esc(person.id)}" type="checkbox" ${selected.includes(person.id) ? "checked" : ""} ${locked} /> ${esc(person.name)}</label>`).join("")
@@ -818,7 +834,7 @@ function entryHtml() {
         return `<div class="field"><span>${esc(field.name)}</span>${boxes}</div>`;
       }
       if (field.type === "multi") {
-        const selected = Array.isArray(value) ? value.map(String) : [];
+        const selected = selectedList(value);
         const boxes = (field.options || []).map((option) => `<label class="field check"><input data-multi="${field.id}" value="${esc(option)}" type="checkbox" ${selected.includes(option) ? "checked" : ""} ${locked} /> ${esc(option)}</label>`).join("");
         return `<div class="field"><span>${esc(field.name)}</span>${boxes}</div>`;
       }
@@ -832,10 +848,14 @@ function entryHtml() {
         return `<label class="field">${esc(field.name)}<textarea data-field="${field.id}" ${locked}>${esc(value)}</textarea></label>`;
       }
       if (field.type === "boolean") {
-        return `<label class="field check"><input data-field="${field.id}" type="checkbox" ${value ? "checked" : ""} ${locked} /> ${esc(field.name)}</label>`;
+        const on = value === true || value === 1 || value === "1" || value === "true" || value === "yes" || value === "Yes";
+        return `<label class="field check"><input data-field="${field.id}" type="checkbox" ${on ? "checked" : ""} ${locked} /> ${esc(field.name)}</label>`;
       }
       if (field.type === "time") {
-        return `<label class="field">${esc(field.name)}<input data-field="${field.id}" type="time" value="${esc(value)}" ${locked} /></label>`;
+        return `<label class="field">${esc(field.name)}<input data-field="${field.id}" type="time" value="${esc(timeInputValue(value))}" ${locked} /></label>`;
+      }
+      if (field.type === "date") {
+        return `<label class="field">${esc(field.name)}<input data-field="${field.id}" type="date" value="${esc(dateInputValue(value))}" ${locked} /></label>`;
       }
       if (field.type === "choice") {
         const options = (field.options || [])
@@ -1225,7 +1245,8 @@ async function saveLibrary() {
       title: !!field.title,
       viewer_edit: !!field.viewer_edit,
       options: field.type === "choice" || field.type === "multi"
-        ? (field.optionsText || "").split(",").map((part) => part.trim()).filter(Boolean)
+        ? (field.optionsText != null ? field.optionsText : (field.options || []).join(", "))
+          .split(",").map((part) => part.trim()).filter(Boolean)
         : undefined,
     }))
     .filter((field) => field.name || field.title));
@@ -1329,7 +1350,7 @@ async function saveEntry(deleted, options = {}) {
     go("library");
     return;
   }
-  const typed = readEntryFromDom(record.values || draft.values || {});
+  const typed = readEntryFromDom({ ...(record.values || {}), ...(draft.values || {}) });
   const empty = !Object.values(typed).some((cell) => cellValue(cell) !== null);
   if (!deleted && options.skipIfUnchanged && existing && !entryChanged(existing.values, typed)) {
     go("library");
@@ -1368,9 +1389,15 @@ function entryChanged(before, after) {
 
 function readEntryFromDom(fallback) {
   const values = clone(fallback) || {};
+  const library = libraryById(state.libraryId);
+  const editable = (fieldId) => {
+    const field = (library?.fields || []).find((item) => item.id === fieldId);
+    if (!field) return true;
+    return canEditField(library, state.draft, field);
+  };
   const grouped = new Map();
   document.querySelectorAll("[data-users], [data-multi]").forEach((el) => {
-    if (el.disabled) return;
+    if (el.disabled || !editable(el.dataset.users || el.dataset.multi)) return;
     const fieldId = el.dataset.users || el.dataset.multi;
     if (!grouped.has(fieldId)) grouped.set(fieldId, []);
     if (el.checked) grouped.get(fieldId).push(el.value);
@@ -1383,7 +1410,7 @@ function readEntryFromDom(fallback) {
     const value = el.type === "checkbox" ? el.checked : el.value;
     const normalized = value === "" ? null : el.type === "number" && value !== "" ? Number(value) : value;
     const previous = values[el.dataset.field];
-    if (el.disabled) return;
+    if (el.disabled || !editable(el.dataset.field)) return;
     if (el.type === "checkbox" && normalized === false && cellValue(previous) === null) return;
     if (!sameVal(previous, { v: normalized })) {
       values[el.dataset.field] = { v: normalized, t: now() };
